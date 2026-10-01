@@ -69,7 +69,10 @@ import {
   Percent,
   Building2,
   SlidersHorizontal,
-  ArrowUpDown
+  ArrowUpDown,
+  Menu,
+  X,
+  Wallet
 } from 'lucide-react';
 
 const MAIN_ADMIN_PIN = "778570";
@@ -184,6 +187,7 @@ export default function App() {
   const [isCashDrawerOpen, setIsCashDrawerOpen] = useState(false);
   const [isSupplierModalOpen, setIsSupplierModalOpen] = useState(false);
   const [isProfitCalcOpen, setIsProfitCalcOpen] = useState(false);
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   // Baki Khata Modals
   const [isAddDueModalOpen, setIsAddDueModalOpen] = useState(false);
@@ -1299,31 +1303,33 @@ export default function App() {
               </div>
             </div>
 
-            {/* Role Badge & Privacy Switch on Mobile */}
+            {/* Mobile Header Quick Actions */}
             <div className="sm:hidden flex items-center gap-1.5">
               <button
                 onClick={togglePrivacyMode}
-                className={`text-[11px] font-bold px-2 py-1 rounded-lg border flex items-center gap-1 ${
+                className={`text-xs font-bold px-2.5 py-1.5 rounded-xl border flex items-center gap-1 shadow-sm active:scale-95 transition-all ${
                   isPrivacyMode
-                    ? 'bg-amber-950/70 border-amber-500/50 text-amber-300'
-                    : 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300'
+                    ? 'bg-amber-950/80 border-amber-500/50 text-amber-300'
+                    : 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
                 }`}
-                title={isPrivacyMode ? 'কেনা দাম গোপন' : 'কেনা দাম দৃশ্যমান'}
+                title={isPrivacyMode ? 'কেনা দাম গোপন (Customer Safe)' : 'কেনা দাম দৃশ্যমান (Owner)'}
               >
-                {isPrivacyMode ? <EyeOff className="w-3 h-3 text-amber-400" /> : <Eye className="w-3 h-3 text-emerald-400" />}
-                <span>{isPrivacyMode ? 'গোপন' : 'উন্মুক্ত'}</span>
+                {isPrivacyMode ? <EyeOff className="w-3.5 h-3.5 text-amber-400" /> : <Eye className="w-3.5 h-3.5 text-emerald-400" />}
+                <span className="text-[11px]">{isPrivacyMode ? 'গোপন' : 'উন্মুক্ত'}</span>
               </button>
+
               <button
-                onClick={() => userRole === 'guest' ? setIsLoginModalOpen(true) : handleLogout()}
-                className="text-[11px] font-bold px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 text-cyan-400"
+                onClick={() => setIsMobileMenuOpen(true)}
+                className="p-1.5 rounded-xl bg-slate-900 border border-slate-800 text-slate-200 hover:text-cyan-400 active:scale-95 transition-all"
+                title="কুইক মেনু ও টুলস"
               >
-                {userRole === 'main_admin' ? 'Admin 🔓' : userRole === 'sub_admin' ? 'Sub Admin' : 'Login 🔒'}
+                <Menu className="w-5 h-5" />
               </button>
             </div>
           </div>
 
-          {/* Navigation & Controls */}
-          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
+          {/* Desktop Navigation & Controls (hidden on mobile, cleanly arranged) */}
+          <div className="hidden sm:flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
             {/* Master Buying Price Privacy Toggle (Desktop & Tablet) */}
             <button
               onClick={togglePrivacyMode}
