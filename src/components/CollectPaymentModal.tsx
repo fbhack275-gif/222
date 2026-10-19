@@ -17,12 +17,14 @@ export const CollectPaymentModal: React.FC<CollectPaymentModalProps> = ({
 }) => {
   const [amount, setAmount] = useState('');
   const [note, setNote] = useState('');
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (customer) {
       const currentDue = customer.totalAmount - (customer.paidAmount || 0);
       setAmount(currentDue > 0 ? String(currentDue) : '');
       setNote('');
+      setError('');
     }
   }, [customer]);
 
@@ -32,20 +34,17 @@ export const CollectPaymentModal: React.FC<CollectPaymentModalProps> = ({
 
   const handleFullPay = () => {
     setAmount(String(currentDue));
+    setError('');
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const numAmount = parseFloat(amount) || 0;
     if (numAmount <= 0) {
-      alert('সঠিক জমার পরিমাণ লিখুন!');
+      setError('সঠিক জমার পরিমাণ লিখুন!');
       return;
     }
-    if (numAmount > currentDue) {
-      if (!confirm(`জমার পরিমাণ (৳${numAmount}) বর্তমান বাকি (৳${currentDue})-র চেয়ে বেশি। আপনি কি নিশ্চিত?`)) {
-        return;
-      }
-    }
+    setError('');
 
     onCollect(customer.id, numAmount, note.trim() || 'নগদ পরিশোধ');
     onClose();
@@ -73,6 +72,11 @@ export const CollectPaymentModal: React.FC<CollectPaymentModalProps> = ({
         </div>
 
         <form onSubmit={handleSubmit} className="p-5 space-y-4">
+          {error && (
+            <div className="p-2.5 rounded-xl bg-red-950/80 border border-red-800 text-red-200 text-xs font-bold text-center">
+              ⚠️ {error}
+            </div>
+          )}
           {/* Customer Summary Card */}
           <div className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800/80 space-y-1">
             <div className="flex justify-between items-center">

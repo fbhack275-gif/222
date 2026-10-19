@@ -1,6 +1,7 @@
-import React from 'react';
-import { X, Calendar, ArrowUpRight, ArrowDownLeft, PlusCircle, DollarSign, Share2, Printer, Trash2 } from 'lucide-react';
+import React, { useState } from 'react';
+import { X, Calendar, ArrowUpRight, ArrowDownLeft, PlusCircle, DollarSign, Share2, Printer, Trash2, QrCode } from 'lucide-react';
 import { CustomerDue } from '../types';
+import { sendWhatsAppMessage } from '../utils/whatsapp';
 
 interface CustomerLedgerModalProps {
   customer: CustomerDue | null;
@@ -8,6 +9,7 @@ interface CustomerLedgerModalProps {
   onAddMoreDue: (customer: CustomerDue) => void;
   onCollectPayment: (customer: CustomerDue) => void;
   onPrintStatement: (customer: CustomerDue) => void;
+  onOpenQrCode?: (customer: CustomerDue) => void;
   onDeleteCustomer?: (customerId: string) => void;
   isAdmin: boolean;
 }
@@ -18,9 +20,12 @@ export const CustomerLedgerModal: React.FC<CustomerLedgerModalProps> = ({
   onAddMoreDue,
   onCollectPayment,
   onPrintStatement,
+  onOpenQrCode,
   onDeleteCustomer,
   isAdmin
 }) => {
+  const [noPhoneWarning, setNoPhoneWarning] = useState(false);
+
   if (!customer) return null;
 
   const currentDue = Math.max(0, customer.totalAmount - (customer.paidAmount || 0));
@@ -28,11 +33,10 @@ export const CustomerLedgerModal: React.FC<CustomerLedgerModalProps> = ({
 
   const handleWhatsApp = () => {
     if (!customer.phone) {
-      alert('গ্রাহকের মোবাইল নম্বর পাওয়া যায়নি!');
+      setNoPhoneWarning(true);
+      setTimeout(() => setNoPhoneWarning(false), 3000);
       return;
     }
-    const cleanPhone = customer.phone.replace(/[^0-9]/g, '');
-    const intlPhone = cleanPhone.startsWith('0') ? '88' + cleanPhone : cleanPhone;
     
     let msg = `আসসালামু আলাইকুম ${customer.name} ভাই,\n`;
     msg += `অনিক টেলিকমে আপনার সর্বমোট বিল ৳${customer.totalAmount}, যার মধ্যে জমা দিয়েছেন ৳${customer.paidAmount}।\n`;
@@ -44,7 +48,7 @@ export const CustomerLedgerModal: React.FC<CustomerLedgerModalProps> = ({
     }
     msg += `ধন্যবাদ - অনিক টেলিকম।`;
 
-    window.open(`https://wa.me/${intlPhone}?text=${encodeURIComponent(msg)}`, '_blank');
+    sendWhatsAppMessage(customer.phone, msg);
   };
 
   const history = customer.history || [];
@@ -77,6 +81,12 @@ export const CustomerLedgerModal: React.FC<CustomerLedgerModalProps> = ({
             <X className="w-4 h-4" />
           </button>
         </div>
+
+        {noPhoneWarning && (
+          <div className="bg-amber-950/80 border-b border-amber-800 text-amber-300 text-xs px-4 py-2 text-center font-bold">
+            ⚠️ কাস্টমারের মোবাইল নম্বর নেই।
+          </div>
+        )}
 
         {/* Balance Highlights */}
         <div className="grid grid-cols-3 gap-2 p-4 bg-slate-950/40 border-b border-slate-800/60">
@@ -116,6 +126,16 @@ export const CustomerLedgerModal: React.FC<CustomerLedgerModalProps> = ({
           </div>
 
           <div className="flex gap-1.5">
+            {onOpenQrCode && (
+              <button
+                onClick={() => onOpenQrCode(customer)}
+                title="গ্রাহকের WhatsApp ও কন্টাক্ট QR কোড"
+                className="p-1.5 text-amber-400 bg-amber-950/40 border border-amber-800/60 hover:bg-amber-900 rounded-lg transition-colors flex items-center gap-1"
+              >
+                <QrCode className="w-4 h-4" />
+                <span className="text-[10px] font-bold hidden sm:inline">QR কোড</span>
+              </button>
+            )}
             {customer.phone && (
               <button
                 onClick={handleWhatsApp}

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { X, Building2, Phone, Plus, DollarSign, Calendar, AlertTriangle, CheckCircle2, Share2, Trash2 } from 'lucide-react';
 import { SupplierDue, DueHistoryItem } from '../types';
+import { sendWhatsAppMessage } from '../utils/whatsapp';
 
 interface SupplierLedgerModalProps {
   isOpen: boolean;
@@ -321,10 +322,8 @@ export const SupplierLedgerModal: React.FC<SupplierLedgerModalProps> = ({
                         {supp.phone && (
                           <button
                             onClick={() => {
-                              const clean = supp.phone?.replace(/[^0-9]/g, '') || '';
-                              const intl = clean.startsWith('0') ? '88' + clean : clean;
                               const msg = `আসসালামু আলাইকুম ${supp.name} ভাই,\nঅনিক টেলিকম থেকে যোগাযোগ করা হচ্ছে। আপনার খাতার হিসাব সম্পর্কিত আলোচনা করতে চাই।\nধন্যবাদ।`;
-                              window.open(`https://wa.me/${intl}?text=${encodeURIComponent(msg)}`, '_blank');
+                              sendWhatsAppMessage(supp.phone || '', msg);
                             }}
                             className="p-1.5 text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 hover:bg-emerald-900 rounded-xl transition-colors"
                             title="হোয়াটসঅ্যাপ মেসেজ পাঠান"

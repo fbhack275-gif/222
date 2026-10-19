@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, Wrench, Smartphone, User, Phone, Check, Calendar, DollarSign } from 'lucide-react';
 import { RepairJob } from '../types';
 
@@ -6,8 +6,9 @@ interface RepairJobModalProps {
   isOpen: boolean;
   onClose: () => void;
   activeSeller: string;
-  onSaveJob: (jobData: Omit<RepairJob, 'id'>) => void;
+  onSaveJob: (jobData: Omit<RepairJob, 'id'>, existingId?: string) => void;
   nextJobNumber: number;
+  editingJob?: RepairJob | null;
 }
 
 export const RepairJobModal: React.FC<RepairJobModalProps> = ({
@@ -15,7 +16,8 @@ export const RepairJobModal: React.FC<RepairJobModalProps> = ({
   onClose,
   activeSeller,
   onSaveJob,
-  nextJobNumber
+  nextJobNumber,
+  editingJob = null
 }) => {
   const [customerName, setCustomerName] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
@@ -24,36 +26,67 @@ export const RepairJobModal: React.FC<RepairJobModalProps> = ({
   const [estimatedCost, setEstimatedCost] = useState('');
   const [advancePaid, setAdvancePaid] = useState('0');
   const [deliveryDate, setDeliveryDate] = useState('');
+  const [status, setStatus] = useState<'pending' | 'ready' | 'delivered'>('pending');
+  const [errorMessage, setErrorMessage] = useState('');
+
+  useEffect(() => {
+    if (isOpen) {
+      if (editingJob) {
+        setCustomerName(editingJob.customerName || '');
+        setCustomerPhone(editingJob.customerPhone || '');
+        setDeviceModel(editingJob.deviceModel || '');
+        setProblem(editingJob.problem || '');
+        setEstimatedCost(String(editingJob.estimatedCost || 0));
+        setAdvancePaid(String(editingJob.advancePaid || 0));
+        setDeliveryDate(editingJob.deliveryDate || '');
+        setStatus(editingJob.status || 'pending');
+      } else {
+        setCustomerName('');
+        setCustomerPhone('');
+        setDeviceModel('');
+        setProblem('');
+        setEstimatedCost('');
+        setAdvancePaid('0');
+        setDeliveryDate('');
+        setStatus('pending');
+      }
+      setErrorMessage('');
+    }
+  }, [isOpen, editingJob]);
 
   if (!isOpen) return null;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!deviceModel.trim()) {
-      alert('মোবাইল মডেলের নাম লিখুন!');
+      setErrorMessage('মোবাইল মডেলের নাম লিখুন!');
       return;
     }
     if (!customerName.trim()) {
-      alert('কাস্টমারের নাম লিখুন!');
+      setErrorMessage('কাস্টমারের নাম লিখুন!');
       return;
     }
+    setErrorMessage('');
 
-    const tokenNo = `TK-${nextJobNumber}`;
-    const todayStr = new Date().toLocaleDateString('en-GB');
+    const tokenNo = editingJob?.tokenNo || `TK-${nextJobNumber}`;
+    const todayStr = editingJob?.date || new Date().toLocaleDateString('en-GB');
 
-    onSaveJob({
-      tokenNo,
-      customerName: customerName.trim(),
-      customerPhone: customerPhone.trim(),
-      deviceModel: deviceModel.trim(),
-      problem: problem.trim() || 'সাধারণ রিপেয়ারিং',
-      estimatedCost: parseFloat(estimatedCost) || 0,
-      advancePaid: parseFloat(advancePaid) || 0,
-      status: 'pending',
-      date: todayStr,
-      deliveryDate: deliveryDate.trim() || 'আজকের মধ্যেই',
-      seller: activeSeller
-    });
+    onSaveJob(
+      {
+        tokenNo,
+        customerName: customerName.trim(),
+        customerPhone: customerPhone.trim(),
+        deviceModel: deviceModel.trim(),
+        problem: problem.trim() || 'সাধারণ রিপেয়ারিং',
+        estimatedCost: parseFloat(estimatedCost) || 0,
+        advancePaid: parseFloat(advancePaid) || 0,
+        status: editingJob ? status : 'pending',
+        date: todayStr,
+        deliveryDate: deliveryDate.trim() || 'আজকের মধ্যেই',
+        seller: editingJob?.seller || activeSeller
+      },
+      editingJob?.id
+    );
 
     onClose();
   };
@@ -68,9 +101,13 @@ export const RepairJobModal: React.FC<RepairJobModalProps> = ({
             </div>
             <div>
               <h3 className="text-sm font-bold text-slate-100">
-                নতুন মোবাইল সার্ভিসিং জব কার্ড (টোকেন #TK-{nextJobNumber})
+                {editingJob
+                  ? `জব কার্ড এডিট করুন (${editingJob.tokenNo})`
+                  : `নতুন মোবাইল সার্ভিসিং জব কার্ড (টোকেন #TK-${nextJobNumber})`}
               </h3>
-              <p className="text-[10px] text-slate-400">কাস্টমারের ফোন জমা নেওয়ার এন্ট্রি</p>
+              <p className="text-[10px] text-slate-400">
+                {editingJob ? 'ভুল তথ্য সংশোধন ও আপডেট করুন' : 'কাস্টমারের ফোন জমা নেওয়ার এন্ট্রি'}
+              </p>
             </div>
           </div>
           <button
@@ -82,6 +119,11 @@ export const RepairJobModal: React.FC<RepairJobModalProps> = ({
         </div>
 
         <form onSubmit={handleSubmit} className="p-5 space-y-3.5">
+          {errorMessage && (
+            <div className="p-2.5 rounded-xl bg-red-950/80 border border-red-800 text-red-200 text-xs font-bold text-center">
+              ⚠️ {errorMessage}
+            </div>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-semibold text-slate-300 mb-1 flex items-center gap-1">
@@ -186,13 +228,30 @@ export const RepairJobModal: React.FC<RepairJobModalProps> = ({
             />
           </div>
 
+          {editingJob && (
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-1">
+                কাজের বর্তমান স্ট্যাটাস
+              </label>
+              <select
+                value={status}
+                onChange={e => setStatus(e.target.value as 'pending' | 'ready' | 'delivered')}
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500 font-semibold"
+              >
+                <option value="pending">কাজ চলছে (Pending) 🟡</option>
+                <option value="ready">ডেলিভারি প্রস্তুত (Ready) 🟢</option>
+                <option value="delivered">ডেলিভারি সম্পন্ন (Delivered) ✅</option>
+              </select>
+            </div>
+          )}
+
           <div className="pt-2">
             <button
               type="submit"
               className="w-full bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-black py-2.5 rounded-xl text-xs shadow-lg transition-transform active:scale-95 flex items-center justify-center gap-2"
             >
               <Check className="w-4 h-4" />
-              <span>জব কার্ড সেভ ও টোকেন রসিদ তৈরি</span>
+              <span>{editingJob ? 'জব কার্ড আপডেট করুন' : 'জব কার্ড সেভ ও টোকেন রসিদ তৈরি'}</span>
             </button>
           </div>
         </form>

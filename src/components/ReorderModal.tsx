@@ -1,6 +1,7 @@
 import React from 'react';
 import { X, Copy, Share2, Printer, AlertTriangle, Check } from 'lucide-react';
 import { InventoryItem } from '../types';
+import { sendWhatsAppMessage } from '../utils/whatsapp';
 
 interface ReorderModalProps {
   isOpen: boolean;
@@ -42,7 +43,7 @@ export const ReorderModal: React.FC<ReorderModalProps> = ({
 
   const handleShareWhatsApp = () => {
     const text = generateTextList();
-    window.open(`https://wa.me/?text=${encodeURIComponent(text)}`, '_blank');
+    sendWhatsAppMessage('', text);
   };
 
   const handlePrint = () => {

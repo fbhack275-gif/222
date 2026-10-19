@@ -1,6 +1,6 @@
 {
   "name": "Anik Telecom - POS, Stock & Baki Khata",
   "description": "Professional Mobile Telecom & Servicing POS with Realtime Stock Value, Customer Baki Khata Ledger, and Smart Hardware Search.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -33,6 +33,7 @@ export const AddDueModal: React.FC<AddDueModalProps> = ({
   const [note, setNote] = useState('');
   const [amount, setAmount] = useState('');
   const [advancePaid, setAdvancePaid] = useState('0');
+  const [formError, setFormError] = useState('');
   const [searchSuggestions, setSearchSuggestions] = useState<CustomerDue[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
 
@@ -89,14 +90,15 @@ export const AddDueModal: React.FC<AddDueModalProps> = ({
     const numAdvance = parseFloat(advancePaid) || 0;
 
     if (numAmount <= 0) {
-      alert('সঠিক বাকি টাকার পরিমাণ লিখুন!');
+      setFormError('সঠিক বাকি টাকার পরিমাণ লিখুন!');
       return;
     }
 
     if (!name.trim()) {
-      alert('কাস্টমারের নাম লিখুন!');
+      setFormError('কাস্টমারের নাম লিখুন!');
       return;
     }
+    setFormError('');
 
     onSave({
       customerId: selectedCustomer?.id,
@@ -142,6 +144,11 @@ export const AddDueModal: React.FC<AddDueModalProps> = ({
         </div>
 
         <form onSubmit={handleSubmit} className="p-5 space-y-4">
+          {formError && (
+            <div className="p-2.5 rounded-xl bg-red-950/80 border border-red-800 text-red-200 text-xs font-bold text-center">
+              ⚠️ {formError}
+            </div>
+          )}
           {/* If existing customer is selected */}
           {selectedCustomer ? (
             <div className="bg-amber-950/20 border border-amber-500/30 rounded-2xl p-3.5 space-y-2">

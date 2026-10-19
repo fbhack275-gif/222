@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   ref, 
   onValue, 
@@ -15,12 +15,17 @@ import {
   ServiceRecord, 
   RepairJob,
   ShopExpense,
+  CashPurchaseRecord,
+  ProductPreOrder,
   UserRole, 
   ReceiptData,
-  DueHistoryItem
+  DueHistoryItem,
+  ShopSettings,
+  DEFAULT_SHOP_SETTINGS
 } from './types';
 import { HighlightText, isMatch } from './utils/highlight';
 import { toCostCode } from './utils/costCode';
+import { sanitizeForFirebase } from './utils/firebaseSanitize';
 import { ReceiptModal } from './components/ReceiptModal';
 import { AddDueModal } from './components/AddDueModal';
 import { CollectPaymentModal } from './components/CollectPaymentModal';
@@ -32,7 +37,31 @@ import { ShopCalculatorModal } from './components/ShopCalculatorModal';
 import { CashDrawerModal } from './components/CashDrawerModal';
 import { SupplierLedgerModal } from './components/SupplierLedgerModal';
 import { ProfitCalculatorModal } from './components/ProfitCalculatorModal';
+import { MobileMenuDrawer } from './components/MobileMenuDrawer';
+import { PosCartModal, CartItem } from './components/PosCartModal';
+import { DailySummaryModal } from './components/DailySummaryModal';
+import { BarcodeScannerModal } from './components/BarcodeScannerModal';
+import { MessageHubModal } from './components/MessageHubModal';
+import { CustomerQrModal } from './components/CustomerQrModal';
+import { CashMemoStudioModal } from './components/CashMemoStudioModal';
+import { InlineBarcodeScanner } from './components/InlineBarcodeScanner';
+import { PreOrdersView } from './components/PreOrdersView';
+import { PreOrderModal } from './components/PreOrderModal';
+import { SettingsModal } from './components/SettingsModal';
+import { ProfessionalCategoryBar } from './components/ProfessionalCategoryBar';
+import { MobilePartsView } from './components/MobilePartsView';
+import { HomeHubView } from './components/HomeHubView';
+import { isMobilePartItem, getCategoryDisplay, CATEGORY_DEFINITIONS } from './utils/categoryHelpers';
+import { sendWhatsAppMessage } from './utils/whatsapp';
+import { exportToCSV } from './utils/csvExport';
 import {
+  playCashRegisterSound,
+  sendBrowserSaleNotification,
+  requestNotificationPermission,
+  isNotificationSupported
+} from './utils/audioNotification';
+import {
+  Home,
   Boxes,
   Wrench,
   BookOpen,
@@ -72,7 +101,20 @@ import {
   ArrowUpDown,
   Menu,
   X,
-  Wallet
+  Wallet,
+  ShoppingCart,
+  ScanBarcode,
+  MessageSquare,
+  FileSpreadsheet,
+  QrCode,
+  RefreshCw,
+  ClipboardList,
+  PackagePlus,
+  History,
+  Volume2,
+  VolumeX,
+  Bell,
+  Settings
 } from 'lucide-react';
 
 const MAIN_ADMIN_PIN = "778570";
@@ -104,22 +146,61 @@ const defaultBrands = [
 ];
 
 export default function App() {
-  // Auth & Roles
+  // Auth & Roles - Main Admin: Anik (pass: 778570), Sub Admin: Parvej (pass: 8797)
   const [userRole, setUserRole] = useState<UserRole>(() => {
-    return (localStorage.getItem('anik_user_role') as UserRole) || 'guest';
+    const savedV2 = localStorage.getItem('anik_auth_role_v2') as UserRole | null;
+    if (savedV2 === 'main_admin' || savedV2 === 'sub_admin' || savedV2 === 'guest') {
+      return savedV2;
+    }
+    return 'guest';
   });
   const [isLoginModalOpen, setIsLoginModalOpen] = useState(false);
+  const [selectedLoginUser, setSelectedLoginUser] = useState<'Anik' | 'Parvej'>('Anik');
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [enteredPin, setEnteredPin] = useState('');
   const [loginError, setLoginError] = useState(false);
+  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'info' | 'error' } | null>(null);
 
-  // App State from Firebase
-  const [inventory, setInventory] = useState<InventoryItem[]>([]);
-  const [salesHistory, setSalesHistory] = useState<SaleRecord[]>([]);
-  const [servicesData, setServicesData] = useState<ServiceRecord[]>([]);
-  const [repairJobs, setRepairJobs] = useState<RepairJob[]>([]);
-  const [shopExpenses, setShopExpenses] = useState<ShopExpense[]>([]);
-  const [duesData, setDuesData] = useState<CustomerDue[]>([]);
-  const [supplierDues, setSupplierDues] = useState<SupplierDue[]>([]);
+  const isMainAdmin = userRole === 'main_admin';
+  const isSubAdmin = userRole === 'sub_admin';
+  const isAdminLoggedIn = userRole === 'main_admin' || userRole === 'sub_admin';
+
+  const showToast = (text: string, type: 'success' | 'info' | 'error' = 'success') => {
+    setToastMessage({ text, type });
+    setTimeout(() => {
+      setToastMessage(prev => (prev?.text === text ? null : prev));
+    }, 3500);
+  };
+
+  // Local Storage resilient helpers
+  const loadInitialLocal = <T,>(key: string, fallback: T): T => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed as unknown as T;
+        if (parsed && typeof parsed === 'object') return parsed as unknown as T;
+      }
+    } catch {}
+    return fallback;
+  };
+
+  const saveLocal = <T,>(key: string, data: T) => {
+    try {
+      localStorage.setItem(key, JSON.stringify(data));
+    } catch {}
+  };
+
+  // App State from Firebase + Local Storage Resilient Cache
+  const [inventory, setInventory] = useState<InventoryItem[]>(() => loadInitialLocal('anik_pos_inventory_v1', []));
+  const [salesHistory, setSalesHistory] = useState<SaleRecord[]>(() => loadInitialLocal('anik_pos_sales_v1', []));
+  const [servicesData, setServicesData] = useState<ServiceRecord[]>(() => loadInitialLocal('anik_pos_services_v1', []));
+  const [repairJobs, setRepairJobs] = useState<RepairJob[]>(() => loadInitialLocal('anik_pos_repairs_v1', []));
+  const [shopExpenses, setShopExpenses] = useState<ShopExpense[]>(() => loadInitialLocal('anik_pos_expenses_v1', []));
+  const [cashPurchases, setCashPurchases] = useState<CashPurchaseRecord[]>(() => loadInitialLocal('anik_pos_cash_purchases_v1', []));
+  const [duesData, setDuesData] = useState<CustomerDue[]>(() => loadInitialLocal('anik_pos_dues_v1', []));
+  const [supplierDues, setSupplierDues] = useState<SupplierDue[]>(() => loadInitialLocal('anik_pos_suppliers_v1', []));
+  const [productPreOrders, setProductPreOrders] = useState<ProductPreOrder[]>(() => loadInitialLocal('anik_pos_preorders_v1', []));
   const [sellers, setSellers] = useState<string[]>(['MD Anik Hossain']);
   const [activeSeller, setActiveSeller] = useState<string>(() => {
     return localStorage.getItem('gsm_active_seller_v16') || 'MD Anik Hossain';
@@ -127,12 +208,27 @@ export default function App() {
   const [isFirebaseConnected, setIsFirebaseConnected] = useState(false);
 
   // UI Tabs & Views
-  const [activeTab, setActiveTab] = useState<'inventory' | 'services' | 'dues' | 'dashboard'>('inventory');
+  const [activeTab, setActiveTab] = useState<'home' | 'inventory' | 'mobile_parts' | 'services' | 'dues' | 'dashboard' | 'preorders'>('home');
+  const [categoryScope, setCategoryScope] = useState<'all' | 'parts' | 'accessories'>('parts');
+  const [showValuationCard, setShowValuationCard] = useState(false);
   const [serviceSubTab, setServiceSubTab] = useState<'repairs' | 'digital' | 'expenses'>('repairs');
   const [inventoryViewMode, setInventoryViewMode] = useState<'folders' | 'all'>('all');
   const [selectedCategory, setSelectedCategory] = useState<string>('');
   const [selectedBrand, setSelectedBrand] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
+  // Recent Searches in Local State & Storage
+  const [recentSearches, setRecentSearches] = useState<string[]>(() => {
+    return loadInitialLocal<string[]>('anik_pos_recent_searches_v1', [
+      'Y20',
+      'Y17',
+      'A50',
+      'Universal',
+      'Realme C21',
+      'Battery'
+    ]);
+  });
+  const [isSearchDropdownOpen, setIsSearchDropdownOpen] = useState(false);
+  const searchContainerRef = useRef<HTMLDivElement>(null);
   const [filterLowStockOnly, setFilterLowStockOnly] = useState(false);
   const [stockStatusFilter, setStockStatusFilter] = useState<'all' | 'in_stock' | 'low_stock' | 'out_of_stock'>('all');
   const [sortBy, setSortBy] = useState<'default' | 'stock_high' | 'stock_low' | 'price_high' | 'price_low'>('default');
@@ -144,50 +240,120 @@ export default function App() {
   const [revealedCardsMap, setRevealedCardsMap] = useState<Record<string, boolean>>({});
   const [expandedModelsMap, setExpandedModelsMap] = useState<Record<string, boolean>>({});
 
+  // Live Sale Notification & Sound State
+  const [latestSaleAlert, setLatestSaleAlert] = useState<{
+    id: string;
+    name: string;
+    qty: number;
+    total: number;
+    seller: string;
+    time: string;
+    isBaki?: boolean;
+  } | null>(null);
+  const [isSoundEnabled, setIsSoundEnabled] = useState<boolean>(() => {
+    return localStorage.getItem('anik_sound_enabled') !== 'false';
+  });
+  const [isBrowserNotificationEnabled, setIsBrowserNotificationEnabled] = useState<boolean>(() => {
+    return typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted';
+  });
+  const isInitialSalesLoad = useRef(true);
+  const knownSaleIds = useRef<Set<string>>(new Set());
+
   // Modals
   const [isItemModalOpen, setIsItemModalOpen] = useState(false);
+  const [isItemInlineScannerOpen, setIsItemInlineScannerOpen] = useState(false);
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
-  const [itemFormData, setItemFormData] = useState({
+  const [itemFormData, setItemFormData] = useState<{
+    category: string;
+    brand: string;
+    name: string;
+    models: string;
+    stock: string | number;
+    price: string | number;
+    sellingPrice: string | number;
+    sku: string;
+  }>({
     category: '',
     brand: '',
     name: '',
     models: '',
-    stock: 0,
-    price: 0,
-    sellingPrice: 0,
+    stock: '1',
+    price: '',
+    sellingPrice: '',
     sku: ''
   });
 
   const [isSellModalOpen, setIsSellModalOpen] = useState(false);
   const [sellingItem, setSellingItem] = useState<InventoryItem | null>(null);
-  const [sellQty, setSellQty] = useState(1);
-  const [sellPrice, setSellPrice] = useState(0);
+  const [sellQty, setSellQty] = useState<string | number>('1');
+  const [sellPrice, setSellPrice] = useState<string | number>('');
   const [sellIsBaki, setSellIsBaki] = useState(false);
   const [sellCustomerName, setSellCustomerName] = useState('');
   const [sellCustomerPhone, setSellCustomerPhone] = useState('');
-  const [sellPaidNow, setSellPaidNow] = useState(0);
+  const [sellPaidNow, setSellPaidNow] = useState<string | number>('');
   const [sellWarranty, setSellWarranty] = useState('কোনো ওয়ারেন্টি নেই');
 
   const [isServiceModalOpen, setIsServiceModalOpen] = useState(false);
-  const [serviceFormData, setServiceFormData] = useState({
+  const [editingService, setEditingService] = useState<ServiceRecord | null>(null);
+  const [serviceFormData, setServiceFormData] = useState<{
+    type: string;
+    desc: string;
+    cost: string | number;
+    paid: string | number;
+    customerName: string;
+    customerPhone: string;
+    isBaki: boolean;
+    date?: string;
+  }>({
     type: 'Recharge/Flexiload',
     desc: '',
-    cost: 0,
-    paid: 0,
+    cost: '',
+    paid: '',
     customerName: '',
     customerPhone: '',
-    isBaki: false
+    isBaki: false,
+    date: ''
   });
 
   // Repair & Expense & Reorder & Calculator & Cash Drawer & Supplier Modals
   const [isRepairModalOpen, setIsRepairModalOpen] = useState(false);
+  const [editingRepairJob, setEditingRepairJob] = useState<RepairJob | null>(null);
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
+  const [editingExpense, setEditingExpense] = useState<ShopExpense | null>(null);
   const [isReorderModalOpen, setIsReorderModalOpen] = useState(false);
+  const [isPreOrderModalOpen, setIsPreOrderModalOpen] = useState(false);
+  const [editingPreOrder, setEditingPreOrder] = useState<ProductPreOrder | null>(null);
   const [isCalculatorOpen, setIsCalculatorOpen] = useState(false);
   const [isCashDrawerOpen, setIsCashDrawerOpen] = useState(false);
   const [isSupplierModalOpen, setIsSupplierModalOpen] = useState(false);
   const [isProfitCalcOpen, setIsProfitCalcOpen] = useState(false);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  // New POS Cart & Researched Options Modals
+  const [cart, setCart] = useState<CartItem[]>([]);
+  const [isCartModalOpen, setIsCartModalOpen] = useState(false);
+  const [isDailySummaryOpen, setIsDailySummaryOpen] = useState(false);
+  const [isBarcodeModalOpen, setIsBarcodeModalOpen] = useState(false);
+  const [isMessageHubOpen, setIsMessageHubOpen] = useState(false);
+  const [isCashMemoStudioOpen, setIsCashMemoStudioOpen] = useState(false);
+  // Settings Modal State
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [shopSettings, setShopSettings] = useState<ShopSettings>(() => {
+    return loadInitialLocal<ShopSettings>('anik_pos_shop_settings_v1', DEFAULT_SHOP_SETTINGS);
+  });
+
+  // Customer WhatsApp & Contact QR Code
+  const [isCustomerQrOpen, setIsCustomerQrOpen] = useState(false);
+  const [qrCustomerData, setQrCustomerData] = useState<{ name: string; phone: string; due: number }>({
+    name: '',
+    phone: '',
+    due: 0
+  });
+
+  const handleOpenCustomerQr = (name: string, phone: string, due: number = 0) => {
+    setQrCustomerData({ name, phone, due });
+    setIsCustomerQrOpen(true);
+  };
 
   // Baki Khata Modals
   const [isAddDueModalOpen, setIsAddDueModalOpen] = useState(false);
@@ -207,22 +373,165 @@ export default function App() {
   // Dashboard Filters
   const [timeFilter, setTimeFilter] = useState<'today' | '7' | '30' | 'all'>('today');
 
-  // 1. Firebase Listeners
+  // Reinvestment / Outside Purchase Form State (বিক্রির টাকায় পুনরায় মাল কেনা ও বাহিরের পার্টস বিক্রি)
+  const [reinvestMode, setReinvestMode] = useState<'instant_sell' | 'restock'>('instant_sell');
+  const [reinvestItemName, setReinvestItemName] = useState('');
+  const [reinvestSelectedItemId, setReinvestSelectedItemId] = useState('');
+  const [reinvestQty, setReinvestQty] = useState<string>('1');
+  const [reinvestBuyPrice, setReinvestBuyPrice] = useState<string>('');
+  const [reinvestSellPrice, setReinvestSellPrice] = useState<string>('');
+  const [reinvestSupplier, setReinvestSupplier] = useState('');
+  const [reinvestCustomer, setReinvestCustomer] = useState('');
+  const [sellingPurchaseId, setSellingPurchaseId] = useState<string | null>(null);
+  const [sellingPurchaseRate, setSellingPurchaseRate] = useState<string>('');
+
+  // Trigger Sale Notification (Web Audio Sound + Browser Notification + In-App Live Alert)
+  const triggerSaleNotification = (saleData: {
+    id: string;
+    name: string;
+    qty: number;
+    total: number;
+    seller: string;
+    isBaki?: boolean;
+  }) => {
+    // Play cash register chime if sound is enabled
+    if (isSoundEnabled) {
+      playCashRegisterSound();
+    }
+
+    const nowStr = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+    setLatestSaleAlert({
+      ...saleData,
+      time: nowStr
+    });
+
+    // Send native browser notification
+    const bakiText = saleData.isBaki ? ' (বাকি বিক্রি)' : ' (নগদ বিক্রি)';
+    sendBrowserSaleNotification(
+      `🎉 নতুন বিক্রি সম্পন্ন! ৳${saleData.total.toLocaleString()}`,
+      `পণ্য: ${saleData.name} (${saleData.qty} পিস)\nবিক্রেতা: ${saleData.seller}${bakiText}`
+    );
+
+    // Auto dismiss in-app alert after 6.5s
+    setTimeout(() => {
+      setLatestSaleAlert(prev => (prev?.id === saleData.id ? null : prev));
+    }, 6500);
+  };
+
+  // Toggle Sound Preference
+  const toggleSoundPreference = () => {
+    const next = !isSoundEnabled;
+    setIsSoundEnabled(next);
+    localStorage.setItem('anik_sound_enabled', String(next));
+    if (next) {
+      playCashRegisterSound();
+      showToast('বিক্রি নোটিফিকেশন সাউন্ড অন করা হয়েছে 🔔', 'success');
+    } else {
+      showToast('নোটিফিকেশন সাউন্ড মিউট করা হয়েছে 🔕', 'info');
+    }
+  };
+
+  // Enable Browser System Notifications
+  const handleEnableBrowserNotifications = async () => {
+    if (!isNotificationSupported()) {
+      showToast('আপনার ব্রাউজার পুশ নোটিফিকেশন সাপোর্ট করে না', 'error');
+      return;
+    }
+    const granted = await requestNotificationPermission();
+    if (granted) {
+      setIsBrowserNotificationEnabled(true);
+      sendBrowserSaleNotification('Anik Telecom নোটিফিকেশন সক্রিয়! ✅', 'এখন থেকে যেকোনো বিক্রি হলে সাথে সাথে নোটিফিকেশন পাবেন।');
+      showToast('ব্রাউজার নোটিফিকেশন সফলভাবে অন করা হয়েছে! 🔔', 'success');
+    } else {
+      showToast('নোটিফিকেশন পারমিশন পাওয়া যায়নি। ব্রাউজার সেটিংসে অনুমতি দিন।', 'error');
+    }
+  };
+
+  // 1. Firebase Listeners + Local Storage Sync
   useEffect(() => {
     const invRef = ref(rtdb, 'inventory');
     const unsubInv = onValue(invRef, snapshot => {
       setIsFirebaseConnected(true);
       const val = snapshot.val();
       if (val) {
-        const list: InventoryItem[] = Object.entries(val).map(([fbKey, itemData]: [string, any]) => ({
-          ...(itemData || {}),
-          id: itemData?.id || fbKey,
-          _fbKey: fbKey
-        }));
-        setInventory(list);
+        const fbList: InventoryItem[] = Object.entries(val)
+          .map(([fbKey, itemData]: [string, any]) => {
+            const raw = itemData || {};
+            const effectiveId = String(raw.id || fbKey);
+            return {
+              id: effectiveId,
+              _fbKey: fbKey,
+              name: String(raw.name || '').trim(),
+              brand: String(raw.brand || 'General').trim(),
+              category: String(raw.category || 'Display').trim(),
+              models: Array.isArray(raw.models)
+                ? raw.models.filter(Boolean)
+                : typeof raw.models === 'string'
+                ? raw.models.split(/[,;\n]+/).map((s: string) => s.trim()).filter(Boolean)
+                : [],
+              stock: typeof raw.stock === 'number' ? raw.stock : parseInt(String(raw.stock)) || 0,
+              price: typeof raw.price === 'number' ? raw.price : parseFloat(String(raw.price)) || 0,
+              sellingPrice: typeof raw.sellingPrice === 'number' ? raw.sellingPrice : parseFloat(String(raw.sellingPrice)) || 0,
+              sku: String(raw.sku || '').trim(),
+              updatedAt: raw.updatedAt || new Date().toLocaleDateString('en-GB')
+            };
+          })
+          .filter(item => Boolean(item.name || item.sku));
+
+        setInventory(prev => {
+          const itemMap = new Map<string, InventoryItem>();
+          
+          // Index remote items by their unique key (_fbKey or id)
+          fbList.forEach(item => {
+            const key = item._fbKey || item.id;
+            itemMap.set(key, item);
+            if (item.id && !itemMap.has(item.id)) {
+              itemMap.set(item.id, item);
+            }
+          });
+
+          // Preserve any item in current session if not yet confirmed by remote snapshot
+          prev.forEach(p => {
+            const key = p._fbKey || p.id;
+            if (!itemMap.has(key) && (!p.id || !itemMap.has(p.id))) {
+              itemMap.set(key, p);
+              const k = String(key).replace(/[.#$[\]/]/g, '_');
+              set(ref(rtdb, 'inventory/' + k), sanitizeForFirebase(p)).catch(() => {});
+            }
+          });
+
+          // Ensure strictly unique items by their unique id / _fbKey
+          const seen = new Set<string>();
+          const merged: InventoryItem[] = [];
+          for (const item of itemMap.values()) {
+            const uniqueKey = item._fbKey || item.id;
+            if (!seen.has(uniqueKey) && (!item.id || !seen.has(item.id))) {
+              seen.add(uniqueKey);
+              if (item.id) seen.add(item.id);
+              merged.push(item);
+            }
+          }
+
+          saveLocal('anik_pos_inventory_v1', merged);
+          return merged;
+        });
       } else {
-        setInventory([]);
+        const local = loadInitialLocal<InventoryItem[]>('anik_pos_inventory_v1', []);
+        if (local.length > 0) {
+          setInventory(local);
+          local.forEach(item => {
+            const k = String(item._fbKey || item.id).replace(/[.#$[\]/]/g, '_');
+            set(ref(rtdb, 'inventory/' + k), sanitizeForFirebase(item)).catch(() => {});
+          });
+        } else {
+          setInventory([]);
+        }
       }
+    }, error => {
+      console.warn('Firebase inventory listener error:', error);
+      setIsFirebaseConnected(false);
+      const local = loadInitialLocal<InventoryItem[]>('anik_pos_inventory_v1', []);
+      if (local.length > 0) setInventory(local);
     });
 
     const salesRef = ref(rtdb, 'salesHistory');
@@ -234,9 +543,38 @@ export default function App() {
           id: saleData?.id || fbKey,
           _fbKey: fbKey
         }));
-        setSalesHistory(list.reverse());
+        const reversed = list.reverse();
+
+        // Check if new sales arrived (from other devices/sellers or counter)
+        if (!isInitialSalesLoad.current && list.length > 0) {
+          const newSales = list.filter(s => !knownSaleIds.current.has(s.id));
+          if (newSales.length > 0) {
+            // Trigger notification for the latest incoming sale
+            const newest = newSales[newSales.length - 1];
+            const lineTotal = (newest.qty || 1) * (newest.sell || 0);
+            triggerSaleNotification({
+              id: newest.id,
+              name: newest.name,
+              qty: newest.qty || 1,
+              total: lineTotal,
+              seller: newest.seller || 'অপারেটর',
+              isBaki: newest.isBaki
+            });
+          }
+        }
+
+        list.forEach(s => knownSaleIds.current.add(s.id));
+        isInitialSalesLoad.current = false;
+
+        setSalesHistory(reversed);
+        saveLocal('anik_pos_sales_v1', reversed);
       } else {
-        setSalesHistory([]);
+        isInitialSalesLoad.current = false;
+        const local = loadInitialLocal<SaleRecord[]>('anik_pos_sales_v1', []);
+        if (local.length > 0) {
+          local.forEach(s => knownSaleIds.current.add(s.id));
+          setSalesHistory(local);
+        }
       }
     });
 
@@ -249,9 +587,12 @@ export default function App() {
           id: srvData?.id || fbKey,
           _fbKey: fbKey
         }));
-        setServicesData(list.reverse());
+        const reversed = list.reverse();
+        setServicesData(reversed);
+        saveLocal('anik_pos_services_v1', reversed);
       } else {
-        setServicesData([]);
+        const local = loadInitialLocal<ServiceRecord[]>('anik_pos_services_v1', []);
+        if (local.length > 0) setServicesData(local);
       }
     });
 
@@ -264,9 +605,12 @@ export default function App() {
           id: jobData?.id || fbKey,
           _fbKey: fbKey
         }));
-        setRepairJobs(list.reverse());
+        const reversed = list.reverse();
+        setRepairJobs(reversed);
+        saveLocal('anik_pos_repairs_v1', reversed);
       } else {
-        setRepairJobs([]);
+        const local = loadInitialLocal<RepairJob[]>('anik_pos_repairs_v1', []);
+        if (local.length > 0) setRepairJobs(local);
       }
     });
 
@@ -279,9 +623,30 @@ export default function App() {
           id: expData?.id || fbKey,
           _fbKey: fbKey
         }));
-        setShopExpenses(list.reverse());
+        const reversed = list.reverse();
+        setShopExpenses(reversed);
+        saveLocal('anik_pos_expenses_v1', reversed);
       } else {
-        setShopExpenses([]);
+        const local = loadInitialLocal<ShopExpense[]>('anik_pos_expenses_v1', []);
+        if (local.length > 0) setShopExpenses(local);
+      }
+    });
+
+    const cashPurchasesRef = ref(rtdb, 'cashPurchases');
+    const unsubCashPurchases = onValue(cashPurchasesRef, snapshot => {
+      const val = snapshot.val();
+      if (val) {
+        const list: CashPurchaseRecord[] = Object.entries(val).map(([fbKey, cpData]: [string, any]) => ({
+          ...(cpData || {}),
+          id: cpData?.id || fbKey,
+          _fbKey: fbKey
+        }));
+        const reversed = list.reverse();
+        setCashPurchases(reversed);
+        saveLocal('anik_pos_cash_purchases_v1', reversed);
+      } else {
+        const local = loadInitialLocal<CashPurchaseRecord[]>('anik_pos_cash_purchases_v1', []);
+        if (local.length > 0) setCashPurchases(local);
       }
     });
 
@@ -294,9 +659,12 @@ export default function App() {
           id: dueData?.id || fbKey,
           _fbKey: fbKey
         }));
-        setDuesData(list.reverse());
+        const reversed = list.reverse();
+        setDuesData(reversed);
+        saveLocal('anik_pos_dues_v1', reversed);
       } else {
-        setDuesData([]);
+        const local = loadInitialLocal<CustomerDue[]>('anik_pos_dues_v1', []);
+        if (local.length > 0) setDuesData(local);
       }
     });
 
@@ -309,9 +677,12 @@ export default function App() {
           id: suppData?.id || fbKey,
           _fbKey: fbKey
         }));
-        setSupplierDues(list.reverse());
+        const reversed = list.reverse();
+        setSupplierDues(reversed);
+        saveLocal('anik_pos_suppliers_v1', reversed);
       } else {
-        setSupplierDues([]);
+        const local = loadInitialLocal<SupplierDue[]>('anik_pos_suppliers_v1', []);
+        if (local.length > 0) setSupplierDues(local);
       }
     });
 
@@ -325,15 +696,48 @@ export default function App() {
       }
     });
 
+    const preordersRef = ref(rtdb, 'productPreOrders');
+    const unsubPreorders = onValue(preordersRef, snapshot => {
+      const val = snapshot.val();
+      if (val) {
+        const list: ProductPreOrder[] = Object.entries(val).map(([fbKey, poData]: [string, any]) => ({
+          ...(poData || {}),
+          id: poData?.id || fbKey,
+          _fbKey: fbKey
+        }));
+        const reversed = list.reverse();
+        setProductPreOrders(reversed);
+        saveLocal('anik_pos_preorders_v1', reversed);
+      } else {
+        const local = loadInitialLocal<ProductPreOrder[]>('anik_pos_preorders_v1', []);
+        if (local.length > 0) setProductPreOrders(local);
+      }
+    });
+
+    const settingsRef = ref(rtdb, 'shopSettings');
+    const unsubSettings = onValue(settingsRef, snapshot => {
+      const val = snapshot.val();
+      if (val && typeof val === 'object') {
+        setShopSettings(prev => {
+          const merged = { ...prev, ...val };
+          saveLocal('anik_pos_shop_settings_v1', merged);
+          return merged;
+        });
+      }
+    });
+
     return () => {
       unsubInv();
       unsubSales();
       unsubServ();
       unsubRepair();
       unsubExpense();
+      unsubCashPurchases();
       unsubDues();
       unsubSupp();
       unsubSellers();
+      unsubPreorders();
+      unsubSettings();
     };
   }, []);
 
@@ -343,21 +747,47 @@ export default function App() {
     localStorage.setItem('gsm_active_seller_v16', name);
   };
 
+  // Update Shop Settings (Local + Firebase Sync)
+  const handleUpdateShopSettings = (newSettings: ShopSettings) => {
+    setShopSettings(newSettings);
+    saveLocal('anik_pos_shop_settings_v1', newSettings);
+    set(ref(rtdb, 'shopSettings'), sanitizeForFirebase(newSettings)).catch(() => {});
+    if (newSettings.soundAlertsEnabled !== isSoundEnabled) {
+      setIsSoundEnabled(newSettings.soundAlertsEnabled);
+      localStorage.setItem('anik_sound_enabled', String(newSettings.soundAlertsEnabled));
+    }
+    showToast('দোকান সেটিংস সফলভাবে আপডেট ও সংরক্ষিত হয়েছে! ✅', 'success');
+  };
+
   // Auth Handling
   const handleLoginSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (enteredPin === MAIN_ADMIN_PIN) {
+    const cleanPass = enteredPin.trim();
+
+    if (cleanPass === MAIN_ADMIN_PIN) {
       setUserRole('main_admin');
+      localStorage.setItem('anik_auth_role_v2', 'main_admin');
       localStorage.setItem('anik_user_role', 'main_admin');
+      handleSellerChange('Anik');
       setIsLoginModalOpen(false);
       setEnteredPin('');
       setLoginError(false);
-    } else if (enteredPin === SUB_ADMIN_PIN) {
+      showToast('স্বাগতম Anik (Main Admin)! পূর্ণ নিয়ন্ত্রণ ও সব এক্সেস চালু হয়েছে 👑', 'success');
+    } else if (cleanPass === SUB_ADMIN_PIN) {
       setUserRole('sub_admin');
+      localStorage.setItem('anik_auth_role_v2', 'sub_admin');
       localStorage.setItem('anik_user_role', 'sub_admin');
+      handleSellerChange('Parvej');
+      setIsPrivacyMode(true);
+      localStorage.setItem('anik_privacy_mode', 'true');
+      setRevealedCardsMap({});
+      if (activeTab === 'dashboard' || activeTab === 'services') {
+        setActiveTab('inventory');
+      }
       setIsLoginModalOpen(false);
       setEnteredPin('');
       setLoginError(false);
+      showToast('স্বাগতম Parvej (Sub Admin)! সেল এন্ট্রি, স্টক এন্ট্রি ও বাকি এন্ট্রি চালু হয়েছে 🛡️', 'info');
     } else {
       setLoginError(true);
     }
@@ -365,11 +795,21 @@ export default function App() {
 
   const handleLogout = () => {
     setUserRole('guest');
+    localStorage.setItem('anik_auth_role_v2', 'guest');
     localStorage.setItem('anik_user_role', 'guest');
+    setIsPrivacyMode(true);
+    setRevealedCardsMap({});
+    setActiveTab('inventory');
+    setIsLoginModalOpen(true);
+    showToast('লগআউট সম্পন্ন হয়েছে। পুনরায় লগইন করুন।', 'info');
   };
 
   // Privacy & Buying Price Protection:
   const togglePrivacyMode = () => {
+    if (userRole !== 'main_admin') {
+      showToast('শুধুমাত্র Main Admin (Anik) কেনা দাম দেখতে পারবেন!', 'error');
+      return;
+    }
     const nextVal = !isPrivacyMode;
     setIsPrivacyMode(nextVal);
     localStorage.setItem('anik_privacy_mode', String(nextVal));
@@ -398,15 +838,23 @@ export default function App() {
 
   // Supplier Handlers
   const handleSaveSupplier = (supplier: SupplierDue) => {
-    set(ref(rtdb, 'supplierDues/' + supplier.id), supplier);
+    setSupplierDues(prev => {
+      const idx = prev.findIndex(s => s.id === supplier.id);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = supplier;
+        return next;
+      }
+      return [supplier, ...prev];
+    });
+    set(ref(rtdb, 'supplierDues/' + supplier.id), sanitizeForFirebase(supplier));
+    showToast(`'${supplier.name}'-এর মহাজন হিসাব আপডেট হয়েছে! ✅`, 'success');
   };
 
   const handleDeleteSupplier = (supplierId: string) => {
-    if (userRole !== 'main_admin') {
-      alert('শুধুমাত্র Main Admin মহাজন প্রোফাইল মুছে ফেলতে পারবেন!');
-      return;
-    }
+    setSupplierDues(prev => prev.filter(s => s.id !== supplierId));
     remove(ref(rtdb, 'supplierDues/' + supplierId));
+    showToast('মহাজন প্রোফাইল মুছে ফেলা হয়েছে', 'info');
   };
 
   // Stock & Inventory Calculations
@@ -442,11 +890,15 @@ export default function App() {
     };
   }, [inventory]);
 
-  // Filtered Inventory with Smart Model Match, SKU, and Sorting
+  // Filtered Inventory with Smart Model Match, SKU, Category Scope and Sorting
   const filteredInventory = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
 
     let list = inventory.filter(item => {
+      // Category Scope Filter (আলাদা অপশন: শুধু মোবাইল পার্টস vs এক্সেসরিজ vs সব)
+      if (categoryScope === 'parts' && !isMobilePartItem(item)) return false;
+      if (categoryScope === 'accessories' && isMobilePartItem(item)) return false;
+
       // Stock Status Filter
       if (stockStatusFilter === 'in_stock' && (item.stock || 0) <= 0) return false;
       if (stockStatusFilter === 'low_stock' && ((item.stock || 0) <= 0 || (item.stock || 0) >= 3)) return false;
@@ -487,7 +939,25 @@ export default function App() {
     }
 
     return list;
-  }, [inventory, searchQuery, filterLowStockOnly, selectedCategory, selectedBrand, stockStatusFilter, sortBy]);
+  }, [inventory, searchQuery, filterLowStockOnly, selectedCategory, selectedBrand, stockStatusFilter, sortBy, categoryScope]);
+
+  // Mobile Parts & Category Breakdown counts
+  const mobilePartsCount = useMemo(() => {
+    return inventory.filter(item => isMobilePartItem(item)).length;
+  }, [inventory]);
+
+  const accessoriesCount = useMemo(() => {
+    return inventory.filter(item => !isMobilePartItem(item)).length;
+  }, [inventory]);
+
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    inventory.forEach(item => {
+      const c = item.category || 'Other';
+      counts[c] = (counts[c] || 0) + 1;
+    });
+    return counts;
+  }, [inventory]);
 
   // Categories & Brands list
   const availableCategories = useMemo(() => {
@@ -496,6 +966,69 @@ export default function App() {
 
   const availableBrands = useMemo(() => {
     return Array.from(new Set([...defaultBrands, ...inventory.map(i => i.brand).filter(Boolean)]));
+  }, [inventory]);
+
+  // Click outside listener for Search Dropdown
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (searchContainerRef.current && !searchContainerRef.current.contains(e.target as Node)) {
+        setIsSearchDropdownOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  // Recent Searches Handlers
+  const handleAddRecentSearch = (query: string) => {
+    const clean = query.trim();
+    if (!clean || clean.length < 2) return;
+    setRecentSearches(prev => {
+      const filtered = prev.filter(item => item.toLowerCase() !== clean.toLowerCase());
+      const updated = [clean, ...filtered].slice(0, 10);
+      saveLocal('anik_pos_recent_searches_v1', updated);
+      return updated;
+    });
+  };
+
+  const handleSelectRecentSearch = (term: string) => {
+    setSearchQuery(term);
+    handleAddRecentSearch(term);
+    setIsSearchDropdownOpen(false);
+  };
+
+  const handleRemoveRecentSearch = (term: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setRecentSearches(prev => {
+      const updated = prev.filter(item => item.toLowerCase() !== term.toLowerCase());
+      saveLocal('anik_pos_recent_searches_v1', updated);
+      return updated;
+    });
+  };
+
+  const handleClearAllRecentSearches = (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setRecentSearches([]);
+    saveLocal('anik_pos_recent_searches_v1', []);
+  };
+
+  // Popular models from inventory for 1-click quick search suggestions
+  const popularInventoryModels = useMemo(() => {
+    const modelSet = new Set<string>();
+    inventory.forEach(item => {
+      if (Array.isArray(item.models)) {
+        item.models.forEach(m => {
+          const trimmed = (m || '').trim();
+          if (trimmed && trimmed.length >= 2 && modelSet.size < 8) {
+            modelSet.add(trimmed);
+          }
+        });
+      }
+    });
+    if (modelSet.size === 0) {
+      ['Y20', 'Y17', 'A50', 'Universal', 'Realme C21', 'Note 8'].forEach(m => modelSet.add(m));
+    }
+    return Array.from(modelSet);
   }, [inventory]);
 
   // Dues Summary
@@ -566,17 +1099,33 @@ export default function App() {
     let grossProfit = 0;
     let soldUnits = 0;
     let totalExpenseAmount = 0;
+    let totalSalesAmount = 0;
+    let totalSalesCashAmount = 0;
+    let totalSalesCost = 0;
+    let totalSalesProfit = 0;
+    let totalServiceIncome = 0;
+    let totalServiceProfit = 0;
 
     const filteredSales = salesHistory.filter(s => isWithinDays(s.date, timeFilter));
     const filteredServices = servicesData.filter(s => isWithinDays(s.date, timeFilter));
     const filteredExpenses = shopExpenses.filter(e => isWithinDays(e.date, timeFilter));
+    const filteredCashPurchases = cashPurchases.filter(cp => isWithinDays(cp.date, timeFilter));
 
     filteredSales.forEach(s => {
       const q = s.qty || 1;
       const sell = s.sell || 0;
       const buy = s.buy || 0;
-      revenue += q * sell;
-      grossProfit += q * (sell - buy);
+      const itemRev = q * sell;
+      const itemCost = q * buy;
+      const itemProf = itemRev - itemCost;
+      revenue += itemRev;
+      totalSalesAmount += itemRev;
+      if (!s.isBaki) {
+        totalSalesCashAmount += itemRev;
+      }
+      totalSalesCost += itemCost;
+      totalSalesProfit += itemProf;
+      grossProfit += itemProf;
       soldUnits += q;
     });
 
@@ -584,6 +1133,8 @@ export default function App() {
       const paid = s.paid || 0;
       const cost = s.cost || 0;
       revenue += paid;
+      totalServiceIncome += paid;
+      totalServiceProfit += paid - cost;
       grossProfit += paid - cost;
       soldUnits += 1;
     });
@@ -592,7 +1143,33 @@ export default function App() {
       totalExpenseAmount += e.amount || 0;
     });
 
+    let totalCashReinvested = 0;
+    let instantOutsideCost = 0;
+    let restockCashCost = 0;
+    filteredCashPurchases.forEach(cp => {
+      const c = cp.totalCost || 0;
+      totalCashReinvested += c;
+      if (cp.type === 'instant_sell') {
+        instantOutsideCost += c;
+      } else {
+        restockCashCost += c;
+      }
+    });
+
+    let periodDueCollected = 0;
+    duesData.forEach(d => {
+      if (d.history) {
+        d.history.forEach(h => {
+          if (h.type === 'payment' && isWithinDays(h.date, timeFilter)) {
+            periodDueCollected += h.amount || 0;
+          }
+        });
+      }
+    });
+
     const netTrueProfit = grossProfit - totalExpenseAmount;
+    const totalCashInHandBeforeSpend = totalSalesCashAmount + totalServiceIncome + periodDueCollected;
+    const netCashRemainingInHand = totalCashInHandBeforeSpend - totalCashReinvested - totalExpenseAmount;
 
     return {
       revenue,
@@ -600,20 +1177,416 @@ export default function App() {
       netTrueProfit,
       totalExpenseAmount,
       soldUnits,
+      totalSalesAmount,
+      totalSalesCashAmount,
+      totalSalesCost,
+      totalSalesProfit,
+      totalServiceIncome,
+      totalServiceProfit,
+      totalCashReinvested,
+      instantOutsideCost,
+      restockCashCost,
+      periodDueCollected,
+      totalCashInHandBeforeSpend,
+      netCashRemainingInHand,
       filteredSales,
       filteredServices,
-      filteredExpenses
+      filteredExpenses,
+      filteredCashPurchases
     };
-  }, [salesHistory, servicesData, shopExpenses, timeFilter]);
+  }, [salesHistory, servicesData, shopExpenses, cashPurchases, duesData, timeFilter]);
+
+  // Today's Executive Pulse Summary for Professional Home Hub
+  const todaySummary = useMemo(() => {
+    let todaySalesRev = 0;
+    let todaySalesCost = 0;
+    let todaySalesUnits = 0;
+    let todaySalesCount = 0;
+    const todaySalesList: SaleRecord[] = [];
+
+    salesHistory.forEach(s => {
+      if (isWithinDays(s.date, 'today')) {
+        const q = s.qty || 1;
+        const sell = s.sell || 0;
+        const buy = s.buy || 0;
+        todaySalesRev += q * sell;
+        todaySalesCost += q * buy;
+        todaySalesUnits += q;
+        todaySalesCount += 1;
+        todaySalesList.push(s);
+      }
+    });
+
+    let todayServiceRev = 0;
+    let todayServiceCost = 0;
+    servicesData.forEach(s => {
+      if (isWithinDays(s.date, 'today')) {
+        todayServiceRev += s.paid || 0;
+        todayServiceCost += s.cost || 0;
+      }
+    });
+
+    let todayExpenseAmount = 0;
+    shopExpenses.forEach(e => {
+      if (isWithinDays(e.date, 'today')) {
+        todayExpenseAmount += e.amount || 0;
+      }
+    });
+
+    const todayGrossProfit = (todaySalesRev - todaySalesCost) + (todayServiceRev - todayServiceCost);
+    const todayNetProfit = todayGrossProfit - todayExpenseAmount;
+
+    return {
+      todaySalesRev,
+      todaySalesCost,
+      todaySalesUnits,
+      todaySalesCount,
+      todaySalesList: [...todaySalesList].reverse(),
+      todayServiceRev,
+      todayGrossProfit,
+      todayNetProfit,
+      todayExpenseAmount
+    };
+  }, [salesHistory, servicesData, shopExpenses]);
+
+  // Fast Receipt Reprint from Home Feed
+  const handleReprintSaleReceipt = (sale: SaleRecord) => {
+    const q = sale.qty || 1;
+    const unitPrice = sale.sell || 0;
+    const total = q * unitPrice;
+    setReceiptData({
+      title: 'ক্যাশ মেমো / বিক্রয় রসিদ (POS)',
+      type: 'sale',
+      date: sale.date || new Date().toLocaleDateString('en-GB'),
+      customerName: sale.customerName || sale.customer || undefined,
+      customerPhone: sale.customerPhone || sale.phone || undefined,
+      items: [{
+        name: sale.name,
+        qty: q,
+        rate: unitPrice,
+        amount: total
+      }],
+      subtotal: total,
+      paid: total,
+      due: 0,
+      seller: sale.seller || activeSeller,
+      note: sale.isBaki ? 'বাকি বিক্রয়' : undefined
+    });
+  };
+
+  // Fast WhatsApp Share from Home Feed
+  const handleShareSaleWhatsApp = (sale: SaleRecord) => {
+    const phone = sale.customerPhone || sale.phone || '';
+    const q = sale.qty || 1;
+    const total = q * (sale.sell || 0);
+    const msg = `*${shopSettings.shopName || 'ANIK TELECOM'}*\nতারিখ: ${sale.date}\nপণ্য: ${sale.name}\nপরিমাণ: ${q} টি\nমূল্য: ৳${total}\nবিক্রেতা: ${sale.seller || activeSeller}\n\nআমাদের সেবা গ্রহণ করার জন্য আন্তরিক ধন্যবাদ!`;
+    sendWhatsAppMessage(phone, msg);
+  };
+
+  // Save Cash Purchase / Reinvestment (বিক্রির টাকায় পুনরায় মাল কেনা বা বাহির থেকে এনে তাৎক্ষণিক বিক্রি)
+  const handleSaveCashPurchase = (e: React.FormEvent) => {
+    e.preventDefault();
+    const qty = Math.max(1, parseInt(reinvestQty) || 1);
+    const unitCost = parseFloat(reinvestBuyPrice) || 0;
+    const sellRate = parseFloat(reinvestSellPrice) || 0;
+
+    const matchedInv = reinvestSelectedItemId
+      ? inventory.find(i => i.id === reinvestSelectedItemId)
+      : undefined;
+    const finalItemName = reinvestItemName.trim() || matchedInv?.name || '';
+
+    if (!finalItemName) {
+      showToast('অনুগ্রহ করে মালের নাম বা মডেল লিখুন!', 'error');
+      return;
+    }
+    if (unitCost <= 0) {
+      showToast('অনুগ্রহ করে কেনা দাম (কত টাকা দিয়ে কিনেছেন) লিখুন!', 'error');
+      return;
+    }
+    if (reinvestMode === 'instant_sell' && sellRate <= 0) {
+      showToast('কাস্টমারের কাছে কত টাকায় বিক্রি/ফিটিং করেছেন তা লিখুন!', 'error');
+      return;
+    }
+
+    const todayStr = new Date().toLocaleDateString('en-GB');
+    const cpId = 'cp_' + Date.now();
+    const totalCost = qty * unitCost;
+
+    if (reinvestMode === 'instant_sell') {
+      const saleId = 'sale_' + Date.now();
+      const newSale: SaleRecord = {
+        id: saleId,
+        itemId: matchedInv?.id || 'outside_part',
+        name: `${finalItemName} (বাহির থেকে কেনা)`,
+        qty,
+        buy: unitCost,
+        sell: sellRate,
+        seller: activeSeller,
+        date: todayStr,
+        customerName: reinvestCustomer.trim() || undefined,
+        isBaki: false,
+        isOutsidePurchase: true,
+        cashPurchaseId: cpId
+      };
+
+      const newCp: CashPurchaseRecord = {
+        id: cpId,
+        itemName: finalItemName,
+        itemId: matchedInv?.id,
+        qty,
+        unitCost,
+        totalCost,
+        sellingPrice: sellRate,
+        supplierName: reinvestSupplier.trim() || 'অন্য দোকান / মার্কেট',
+        customerName: reinvestCustomer.trim() || undefined,
+        type: 'instant_sell',
+        isSold: true,
+        saleId,
+        seller: activeSeller,
+        date: todayStr
+      };
+
+      setSalesHistory(prev => {
+        const next = [newSale, ...prev];
+        saveLocal('anik_pos_sales_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'salesHistory/' + saleId), sanitizeForFirebase(newSale)).catch(() => {});
+
+      setCashPurchases(prev => {
+        const next = [newCp, ...prev];
+        saveLocal('anik_pos_cash_purchases_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'cashPurchases/' + cpId), sanitizeForFirebase(newCp)).catch(() => {});
+
+      const profit = qty * (sellRate - unitCost);
+      showToast(
+        `✅ '${finalItemName}' ৳${totalCost} দিয়ে কিনে ৳${qty * sellRate}-এ বিক্রি সম্পন্ন! লাভ: ৳${profit}`,
+        'success'
+      );
+
+      setReinvestItemName('');
+      setReinvestSelectedItemId('');
+      setReinvestQty('1');
+      setReinvestBuyPrice('');
+      setReinvestSellPrice('');
+      setReinvestSupplier('');
+      setReinvestCustomer('');
+    } else {
+      const newCp: CashPurchaseRecord = {
+        id: cpId,
+        itemName: finalItemName,
+        itemId: matchedInv?.id,
+        qty,
+        unitCost,
+        totalCost,
+        sellingPrice: sellRate > 0 ? sellRate : matchedInv?.sellingPrice || 0,
+        supplierName: reinvestSupplier.trim() || 'মার্কেট / অন্য দোকান',
+        type: 'restock',
+        isSold: false,
+        seller: activeSeller,
+        date: todayStr
+      };
+
+      setCashPurchases(prev => {
+        const next = [newCp, ...prev];
+        saveLocal('anik_pos_cash_purchases_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'cashPurchases/' + cpId), sanitizeForFirebase(newCp)).catch(() => {});
+
+      if (matchedInv) {
+        const updatedStock = (matchedInv.stock || 0) + qty;
+        const updatedItem: InventoryItem = {
+          ...matchedInv,
+          stock: updatedStock,
+          price: unitCost,
+          sellingPrice: sellRate > 0 ? sellRate : matchedInv.sellingPrice,
+          updatedAt: todayStr
+        };
+        setInventory(prev => {
+          const next = prev.map(i => i.id === matchedInv.id ? updatedItem : i);
+          saveLocal('anik_pos_inventory_v1', next);
+          return next;
+        });
+        const safeKey = String(matchedInv._fbKey || matchedInv.id).replace(/[.#$[\]/]/g, '_');
+        set(ref(rtdb, 'inventory/' + safeKey), sanitizeForFirebase(updatedItem)).catch(() => {});
+        showToast(
+          `✅ বিক্রির ক্যাশ থেকে ৳${totalCost} দিয়ে '${finalItemName}' (${qty} পিস) কেনা হয়েছে ও স্টকে যোগ হয়েছে!`,
+          'success'
+        );
+      } else {
+        const newInvId = 'item_' + Date.now();
+        const newInvItem: InventoryItem = {
+          id: newInvId,
+          _fbKey: newInvId,
+          name: finalItemName,
+          brand: 'General',
+          category: 'Display',
+          models: [finalItemName],
+          stock: qty,
+          price: unitCost,
+          sellingPrice: sellRate > 0 ? sellRate : unitCost + 300,
+          sku: 'ANIK-' + Math.floor(1000 + Math.random() * 9000),
+          updatedAt: todayStr
+        };
+        setInventory(prev => {
+          const next = [newInvItem, ...prev];
+          saveLocal('anik_pos_inventory_v1', next);
+          return next;
+        });
+        set(ref(rtdb, 'inventory/' + newInvId), sanitizeForFirebase(newInvItem)).catch(() => {});
+        showToast(
+          `✅ বিক্রির ক্যাশ থেকে ৳${totalCost} দিয়ে '${finalItemName}' কিনে নতুন স্টকে জমা করা হয়েছে!`,
+          'success'
+        );
+      }
+
+      setReinvestItemName('');
+      setReinvestSelectedItemId('');
+      setReinvestQty('1');
+      setReinvestBuyPrice('');
+      setReinvestSellPrice('');
+      setReinvestSupplier('');
+      setReinvestCustomer('');
+    }
+  };
+
+  const handleConfirmSellFromPurchase = (cp: CashPurchaseRecord) => {
+    const sellPriceNum = parseFloat(sellingPurchaseRate);
+    if (isNaN(sellPriceNum) || sellPriceNum <= 0) {
+      showToast('সঠিক বিক্রয় মূল্য লিখুন!', 'error');
+      return;
+    }
+
+    const todayStr = new Date().toLocaleDateString('en-GB');
+    const saleId = 'sale_' + Date.now();
+    const newSale: SaleRecord = {
+      id: saleId,
+      itemId: cp.itemId || 'outside_part',
+      name: `${cp.itemName} (পুনরায় কেনা স্টক)`,
+      qty: cp.qty,
+      buy: cp.unitCost,
+      sell: sellPriceNum,
+      seller: activeSeller,
+      date: todayStr,
+      isBaki: false,
+      isOutsidePurchase: true,
+      cashPurchaseId: cp.id
+    };
+
+    setSalesHistory(prev => {
+      const next = [newSale, ...prev];
+      saveLocal('anik_pos_sales_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'salesHistory/' + saleId), sanitizeForFirebase(newSale)).catch(() => {});
+
+    knownSaleIds.current.add(saleId);
+    triggerSaleNotification({
+      id: saleId,
+      name: `${cp.itemName} (পুনরায় কেনা স্টক)`,
+      qty: cp.qty,
+      total: cp.qty * sellPriceNum,
+      seller: activeSeller,
+      isBaki: false
+    });
+
+    const updatedCp: CashPurchaseRecord = {
+      ...cp,
+      isSold: true,
+      sellingPrice: sellPriceNum,
+      saleId
+    };
+    setCashPurchases(prev => {
+      const next = prev.map(item => item.id === cp.id ? updatedCp : item);
+      saveLocal('anik_pos_cash_purchases_v1', next);
+      return next;
+    });
+    const cpKey = String(cp._fbKey || cp.id).replace(/[.#$[\]/]/g, '_');
+    set(ref(rtdb, 'cashPurchases/' + cpKey), sanitizeForFirebase(updatedCp)).catch(() => {});
+
+    if (cp.itemId) {
+      const invItem = inventory.find(i => i.id === cp.itemId);
+      if (invItem) {
+        const rem = Math.max(0, (invItem.stock || 0) - cp.qty);
+        const updatedInv = { ...invItem, stock: rem };
+        setInventory(prev => {
+          const next = prev.map(i => i.id === invItem.id ? updatedInv : i);
+          saveLocal('anik_pos_inventory_v1', next);
+          return next;
+        });
+        const invKey = String(invItem._fbKey || invItem.id).replace(/[.#$[\]/]/g, '_');
+        update(ref(rtdb, 'inventory/' + invKey), { stock: rem }).catch(() => {});
+      }
+    }
+
+    setSellingPurchaseId(null);
+    setSellingPurchaseRate('');
+    const profit = cp.qty * (sellPriceNum - cp.unitCost);
+    showToast(`✅ '${cp.itemName}' ৳${cp.qty * sellPriceNum} টাকায় বিক্রি সম্পন্ন! লাভ: ৳${profit}`, 'success');
+  };
+
+  const handleDeleteCashPurchase = (cp: CashPurchaseRecord) => {
+    if (userRole !== 'main_admin') {
+      showToast('শুধুমাত্র Main Admin এই হিসাব ডিলিট করতে পারবেন!', 'error');
+      return;
+    }
+    const cpKey = String(cp._fbKey || cp.id).replace(/[.#$[\]/]/g, '_');
+    setCashPurchases(prev => {
+      const next = prev.filter(item => item.id !== cp.id);
+      saveLocal('anik_pos_cash_purchases_v1', next);
+      return next;
+    });
+    remove(ref(rtdb, 'cashPurchases/' + cpKey)).catch(() => {});
+    showToast('পুনরায় মাল ক্রয়ের হিসাব মুছে ফেলা হয়েছে', 'info');
+  };
 
   // Handlers for Repair Jobs & Expenses
-  const handleSaveRepairJob = (jobData: Omit<RepairJob, 'id'>) => {
+  const handleOpenAddRepairJob = () => {
+    setEditingRepairJob(null);
+    setIsRepairModalOpen(true);
+  };
+
+  const handleOpenEditRepairJob = (job: RepairJob) => {
+    setEditingRepairJob(job);
+    setIsRepairModalOpen(true);
+  };
+
+  const handleSaveRepairJob = (jobData: Omit<RepairJob, 'id'>, existingId?: string) => {
+    const targetId = existingId || editingRepairJob?.id;
+    if (targetId) {
+      const safeKey = String(editingRepairJob?._fbKey || targetId).replace(/[.#$[\]/]/g, '_');
+      const updatedJob: RepairJob = {
+        ...jobData,
+        id: targetId,
+        _fbKey: safeKey
+      };
+      setRepairJobs(prev => {
+        const next = prev.map(j => (j.id === targetId || j._fbKey === safeKey) ? updatedJob : j);
+        saveLocal('anik_pos_repairs_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'repairJobs/' + safeKey), sanitizeForFirebase(updatedJob)).catch(() => {});
+      setEditingRepairJob(null);
+      showToast(`জব কার্ড #${updatedJob.tokenNo} (${updatedJob.deviceModel}) এডিট ও আপডেট সম্পন্ন হয়েছে! ✅`, 'success');
+      return;
+    }
+
     const jobId = 'repair_' + Date.now();
     const newJob: RepairJob = {
       ...jobData,
-      id: jobId
+      id: jobId,
+      _fbKey: jobId
     };
-    set(ref(rtdb, 'repairJobs/' + jobId), newJob);
+    setRepairJobs(prev => {
+      const next = [newJob, ...prev];
+      saveLocal('anik_pos_repairs_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'repairJobs/' + jobId), sanitizeForFirebase(newJob)).catch(() => {});
+    showToast(`জব কার্ড #${newJob.tokenNo} (${newJob.deviceModel}) তৈরি হয়েছে! ✅`, 'success');
 
     // Generate Token Receipt
     setReceiptData({
@@ -636,67 +1609,339 @@ export default function App() {
     });
   };
 
+  const handleDeleteRepairJob = (job: RepairJob) => {
+    if (confirm(`'${job.deviceModel}' (${job.tokenNo}) জব কার্ডটি কি মুছে ফেলতে চান?`)) {
+      const safeKey = String(job._fbKey || job.id).replace(/[.#$[\]/]/g, '_');
+      setRepairJobs(prev => {
+        const next = prev.filter(j => j.id !== job.id && j._fbKey !== safeKey);
+        saveLocal('anik_pos_repairs_v1', next);
+        return next;
+      });
+      remove(ref(rtdb, 'repairJobs/' + safeKey)).catch(() => {});
+      showToast(`জব কার্ড (${job.tokenNo}) মুছে ফেলা হয়েছে`, 'info');
+    }
+  };
+
   const handleUpdateRepairStatus = (job: RepairJob, newStatus: 'pending' | 'ready' | 'delivered') => {
-    update(ref(rtdb, 'repairJobs/' + job.id), { status: newStatus });
+    const safeKey = String(job._fbKey || job.id).replace(/[.#$[\]/]/g, '_');
+    setRepairJobs(prev => {
+      const next = prev.map(j => (j.id === job.id || j._fbKey === safeKey) ? { ...j, status: newStatus } : j);
+      saveLocal('anik_pos_repairs_v1', next);
+      return next;
+    });
+    update(ref(rtdb, 'repairJobs/' + safeKey), { status: newStatus }).catch(() => {});
+    showToast(`স্ট্যাটাস পরিবর্তন: ${newStatus === 'ready' ? 'কাজ শেষ (রেডি)' : newStatus === 'delivered' ? 'ডেলিভারি সম্পন্ন' : 'কাজ চলছে'}`, 'info');
     if (newStatus === 'ready' && job.customerPhone) {
       const remainingDue = Math.max(0, job.estimatedCost - job.advancePaid);
-      const cleanPhone = job.customerPhone.replace(/[^0-9]/g, '');
-      const intlPhone = cleanPhone.startsWith('0') ? '88' + cleanPhone : cleanPhone;
       let msg = `আসসালামু আলাইকুম ${job.customerName} ভাই,\n`;
       msg += `অনিক টেলিকম থেকে জানানো হচ্ছে আপনার ${job.deviceModel} মোবাইলটির রিপেয়ারিং কাজ সম্পন্ন হয়েছে।\n`;
       if (remainingDue > 0) {
         msg += `আপনার অবশিষ্ট বিল: ৳${remainingDue} টাকা।\n`;
       }
       msg += `অনুগ্রহ করে দোকানে এসে আপনার ফোনটি সংগ্রহ করার অনুরোধ রইল।\nধন্যবাদ - অনিক টেলিকম।`;
-      window.open(`https://wa.me/${intlPhone}?text=${encodeURIComponent(msg)}`, '_blank');
+      sendWhatsAppMessage(job.customerPhone, msg);
     }
   };
 
-  const handleSaveExpense = (expData: Omit<ShopExpense, 'id'>) => {
+  const handleOpenEditExpense = (exp: ShopExpense) => {
+    setEditingExpense(exp);
+    setIsExpenseModalOpen(true);
+  };
+
+  const handleSaveExpense = (expData: Omit<ShopExpense, 'id'>, existingId?: string) => {
+    const targetId = existingId || editingExpense?.id;
+    if (targetId) {
+      const safeKey = String(editingExpense?._fbKey || targetId).replace(/[.#$[\]/]/g, '_');
+      const updatedExp: ShopExpense = {
+        ...expData,
+        id: targetId,
+        _fbKey: safeKey
+      };
+      setShopExpenses(prev => {
+        const next = prev.map(e => (e.id === targetId || e._fbKey === safeKey) ? updatedExp : e);
+        saveLocal('anik_pos_expenses_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'shopExpenses/' + safeKey), sanitizeForFirebase(updatedExp))
+        .then(() => {
+          showToast(`৳${updatedExp.amount} টাকার দোকান খরচ (${updatedExp.category}) আপডেট হয়েছে! ✅`, 'success');
+        })
+        .catch(() => {
+          showToast(`৳${updatedExp.amount} টাকার দোকান খরচ আপডেট হয়েছে! ✅`, 'success');
+        });
+      setEditingExpense(null);
+      return;
+    }
+
     const expId = 'exp_' + Date.now();
     const newExp: ShopExpense = {
       ...expData,
-      id: expId
+      id: expId,
+      _fbKey: expId
     };
-    set(ref(rtdb, 'shopExpenses/' + expId), newExp);
+    setShopExpenses(prev => {
+      const next = [newExp, ...prev];
+      saveLocal('anik_pos_expenses_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'shopExpenses/' + expId), sanitizeForFirebase(newExp))
+      .then(() => {
+        showToast(`৳${newExp.amount} টাকার দোকান খরচ (${newExp.category}) সফলভাবে সেভ হয়েছে! ✅`, 'success');
+      })
+      .catch(err => {
+        console.warn('Firebase expense save error, saved locally:', err);
+        showToast(`৳${newExp.amount} টাকার দোকান খরচ লোকাল মেমরিতে সেভ হয়েছে! ✅`, 'success');
+      });
+  };
+
+  const handleDeleteExpense = (expId: string, expName: string) => {
+    if (confirm(`'${expName}' খরচের রেকর্ডটি মুছে ফেলতে চান?`)) {
+      setShopExpenses(prev => {
+        const next = prev.filter(e => e.id !== expId && e._fbKey !== expId);
+        saveLocal('anik_pos_expenses_v1', next);
+        return next;
+      });
+      const safeKey = String(expId).replace(/[.#$[\]/]/g, '_');
+      remove(ref(rtdb, 'shopExpenses/' + safeKey)).catch(() => {});
+      showToast('খরচের রেকর্ড মুছে ফেলা হয়েছে', 'info');
+    }
+  };
+
+  // Handlers for Pre-Orders & Product Requisitions
+  const handleOpenAddPreOrder = () => {
+    setEditingPreOrder(null);
+    setIsPreOrderModalOpen(true);
+  };
+
+  const handleOpenEditPreOrder = (order: ProductPreOrder) => {
+    setEditingPreOrder(order);
+    setIsPreOrderModalOpen(true);
+  };
+
+  const handleSavePreOrder = (orderData: Omit<ProductPreOrder, 'id'>, existingId?: string) => {
+    const targetId = existingId || editingPreOrder?.id;
+    if (targetId) {
+      const safeKey = String(editingPreOrder?._fbKey || targetId).replace(/[.#$[\]/]/g, '_');
+      const updatedOrder: ProductPreOrder = {
+        ...orderData,
+        id: targetId,
+        _fbKey: safeKey
+      };
+      setProductPreOrders(prev => {
+        const next = prev.map(o => (o.id === targetId || o._fbKey === safeKey) ? updatedOrder : o);
+        saveLocal('anik_pos_preorders_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'productPreOrders/' + safeKey), sanitizeForFirebase(updatedOrder)).catch(() => {});
+      setEditingPreOrder(null);
+      showToast(`'${updatedOrder.itemName}' অর্ডার/চাহিদা আপডেট সম্পন্ন হয়েছে! ✅`, 'success');
+      return;
+    }
+
+    const orderId = 'preorder_' + Date.now();
+    const newOrder: ProductPreOrder = {
+      ...orderData,
+      id: orderId,
+      _fbKey: orderId
+    };
+    setProductPreOrders(prev => {
+      const next = [newOrder, ...prev];
+      saveLocal('anik_pos_preorders_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'productPreOrders/' + orderId), sanitizeForFirebase(newOrder)).catch(() => {});
+    showToast(`'${newOrder.itemName}' সফলভাবে তালিকায় যুক্ত করা হয়েছে! ✅`, 'success');
+
+    // If customer order with advance paid, generate advance receipt modal
+    if (newOrder.type === 'customer_order' && newOrder.advancePaid > 0) {
+      setReceiptData({
+        title: 'কাস্টমার প্রি-অর্ডার ও বায়না রসিদ',
+        type: 'preorder_token',
+        date: newOrder.orderDate,
+        customerName: newOrder.customerName,
+        customerPhone: newOrder.customerPhone,
+        items: [
+          {
+            name: `${newOrder.itemName} ${newOrder.modelOrCode ? `(${newOrder.modelOrCode})` : ''} - [${newOrder.purpose}]`,
+            qty: newOrder.qty || 1,
+            rate: newOrder.estimatedPrice,
+            amount: newOrder.estimatedPrice
+          }
+        ],
+        subtotal: newOrder.estimatedPrice,
+        paid: newOrder.advancePaid,
+        due: newOrder.dueAmount,
+        seller: activeSeller,
+        note: `সম্ভাব্য ডেলিভারি: ${newOrder.expectedDate || 'শীঘ্রই'} | কাজের বিবরণ: ${newOrder.purpose}`
+      });
+    }
+  };
+
+  const handleDeletePreOrder = (id: string) => {
+    const target = productPreOrders.find(o => o.id === id);
+    const safeKey = String(target?._fbKey || id).replace(/[.#$[\]/]/g, '_');
+    setProductPreOrders(prev => {
+      const next = prev.filter(o => o.id !== id && o._fbKey !== safeKey);
+      saveLocal('anik_pos_preorders_v1', next);
+      return next;
+    });
+    remove(ref(rtdb, 'productPreOrders/' + safeKey)).catch(() => {});
+    showToast('তালিকা থেকে মুছে ফেলা হয়েছে', 'info');
+  };
+
+  const handleUpdatePreOrderStatus = (id: string, status: 'pending' | 'arrived' | 'delivered' | 'cancelled') => {
+    const target = productPreOrders.find(o => o.id === id);
+    if (!target) return;
+    const safeKey = String(target._fbKey || id).replace(/[.#$[\]/]/g, '_');
+    const updated: ProductPreOrder = {
+      ...target,
+      status,
+      deliveredDate: status === 'delivered' ? new Date().toLocaleDateString('en-GB') : target.deliveredDate
+    };
+    setProductPreOrders(prev => {
+      const next = prev.map(o => (o.id === id || o._fbKey === safeKey) ? updated : o);
+      saveLocal('anik_pos_preorders_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'productPreOrders/' + safeKey), sanitizeForFirebase(updated)).catch(() => {});
+    showToast(`স্ট্যাটাস পরিবর্তন: ${status === 'arrived' ? 'মাল দোকানে এসেছে 🟢' : status === 'delivered' ? 'ডেলিভারি সম্পন্ন 🔵' : 'পেন্ডিং 🟡'}`, 'success');
+  };
+
+  const handleAddExtraAdvance = (orderId: string, additionalAmount: number, method: string) => {
+    const target = productPreOrders.find(o => o.id === orderId);
+    if (!target) return;
+    const safeKey = String(target._fbKey || orderId).replace(/[.#$[\]/]/g, '_');
+    const newAdvance = (target.advancePaid || 0) + additionalAmount;
+    const newDue = Math.max(0, (target.estimatedPrice || 0) - newAdvance);
+    const newHistory = [
+      ...(target.advanceHistory || []),
+      {
+        date: new Date().toLocaleDateString('en-GB'),
+        amount: additionalAmount,
+        method: method || 'নগদ ক্যাশ',
+        note: 'অতিরিক্ত বায়না জমা'
+      }
+    ];
+    const updated: ProductPreOrder = {
+      ...target,
+      advancePaid: newAdvance,
+      dueAmount: newDue,
+      advancePaymentMethod: method || target.advancePaymentMethod || 'নগদ ক্যাশ',
+      advanceHistory: newHistory
+    };
+    setProductPreOrders(prev => {
+      const next = prev.map(o => (o.id === orderId || o._fbKey === safeKey) ? updated : o);
+      saveLocal('anik_pos_preorders_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'productPreOrders/' + safeKey), sanitizeForFirebase(updated)).catch(() => {});
+    showToast(`৳${additionalAmount} অতিরিক্ত বায়না জমা হয়েছে! (বাকি: ৳${newDue}) ✅`, 'success');
+
+    // Prompt updated advance receipt slip
+    setReceiptData({
+      title: 'অতিরিক্ত বায়না জমা রসিদ',
+      type: 'preorder_token',
+      date: new Date().toLocaleDateString('en-GB'),
+      customerName: target.customerName,
+      customerPhone: target.customerPhone,
+      items: [
+        {
+          name: `${target.itemName} (অতিরিক্ত বায়না - ${method})`,
+          qty: target.qty || 1,
+          rate: target.estimatedPrice,
+          amount: target.estimatedPrice
+        }
+      ],
+      subtotal: target.estimatedPrice,
+      paid: newAdvance,
+      due: newDue,
+      seller: activeSeller,
+      note: `অতিরিক্ত বায়না গ্রহণ: ৳${additionalAmount} (${method}) | মোট জমা: ৳${newAdvance}`
+    });
+  };
+
+  const handleSettlePreOrderBalance = (orderId: string) => {
+    const target = productPreOrders.find(o => o.id === orderId);
+    if (!target) return;
+    const safeKey = String(target._fbKey || orderId).replace(/[.#$[\]/]/g, '_');
+    const due = target.dueAmount || 0;
+    const fullAmount = target.estimatedPrice || target.advancePaid;
+    const newHistory = [
+      ...(target.advanceHistory || []),
+      {
+        date: new Date().toLocaleDateString('en-GB'),
+        amount: due,
+        method: 'নগদ ক্যাশ',
+        note: 'ডেলিভারি কালেকশন ও পূর্ণ বাকি পরিশোধ'
+      }
+    ];
+    const updated: ProductPreOrder = {
+      ...target,
+      advancePaid: fullAmount,
+      dueAmount: 0,
+      status: 'delivered',
+      deliveredDate: new Date().toLocaleDateString('en-GB'),
+      advanceHistory: newHistory
+    };
+    setProductPreOrders(prev => {
+      const next = prev.map(o => (o.id === orderId || o._fbKey === safeKey) ? updated : o);
+      saveLocal('anik_pos_preorders_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'productPreOrders/' + safeKey), sanitizeForFirebase(updated)).catch(() => {});
+    showToast(`'${target.itemName}' এর বাকি ৳${due} আদায় ও ডেলিভারি সম্পন্ন! 🔵`, 'success');
+
+    // Generate final settlement receipt
+    setReceiptData({
+      title: 'প্রি-অর্ডার ডেলিভারি ও বিক্রয় পরিশোধ রসিদ',
+      type: 'preorder_token',
+      date: new Date().toLocaleDateString('en-GB'),
+      customerName: target.customerName,
+      customerPhone: target.customerPhone,
+      items: [
+        {
+          name: `${target.itemName} [ডেলিভারি সম্পন্ন]`,
+          qty: target.qty || 1,
+          rate: target.estimatedPrice,
+          amount: target.estimatedPrice
+        }
+      ],
+      subtotal: target.estimatedPrice,
+      paid: fullAmount,
+      due: 0,
+      seller: activeSeller,
+      note: `পূর্বে বায়না: ৳${target.advancePaid} | শেষ জমা: ৳${due} | সম্পূর্ণ পরিশোধিত`
+    });
   };
 
   // Open Edit / Add Item Modal
-  const handleOpenAddItem = () => {
-    if (userRole !== 'main_admin') {
-      alert('শুধুমাত্র Main Admin মালামাল যোগ বা এডিট করতে পারবেন!');
-      setIsLoginModalOpen(true);
-      return;
-    }
+  const handleOpenAddItem = (prefilledSku?: string | React.MouseEvent) => {
     setEditingItem(null);
+    setIsItemInlineScannerOpen(false);
     setItemFormData({
-      category: selectedCategory || '',
-      brand: selectedBrand || '',
+      category: selectedCategory || 'Display',
+      brand: selectedBrand || 'Vivo',
       name: '',
       models: '',
-      stock: 0,
-      price: 0,
-      sellingPrice: 0,
-      sku: ''
+      stock: '1',
+      price: '',
+      sellingPrice: '',
+      sku: typeof prefilledSku === 'string' ? prefilledSku : ''
     });
     setIsItemModalOpen(true);
   };
 
   const handleOpenEditItem = (item: InventoryItem) => {
-    if (userRole !== 'main_admin') {
-      alert('শুধুমাত্র Main Admin মালামাল এডিট করতে পারবেন!');
-      setIsLoginModalOpen(true);
-      return;
-    }
     setEditingItem(item);
+    setIsItemInlineScannerOpen(false);
     setItemFormData({
-      category: item.category || '',
-      brand: item.brand || '',
+      category: item.category || 'Display',
+      brand: item.brand || 'Other',
       name: item.name || '',
       models: Array.isArray(item.models) ? item.models.join(', ') : '',
-      stock: item.stock || 0,
-      price: item.price || 0,
-      sellingPrice: item.sellingPrice || 0,
+      stock: item.stock !== undefined && item.stock !== null ? String(item.stock) : '',
+      price: item.price ? String(item.price) : '',
+      sellingPrice: item.sellingPrice ? String(item.sellingPrice) : '',
       sku: item.sku || ''
     });
     setIsItemModalOpen(true);
@@ -704,65 +1949,437 @@ export default function App() {
 
   const handleSaveItem = (e: React.FormEvent) => {
     e.preventDefault();
-    if (userRole !== 'main_admin') return;
 
-    const itemId = editingItem ? editingItem.id : 'item_' + Date.now();
+    if (!itemFormData.name.trim()) {
+      showToast('পার্টস বা পণ্যের নাম লিখুন!', 'error');
+      return;
+    }
+
+    const targetId = editingItem?.id || ('item_' + Date.now());
+    const safeFbKey = String(editingItem?._fbKey || targetId).replace(/[.#$[\]/]/g, '_');
     const modelsArr = itemFormData.models
-      .split(',')
-      .map(m => m.trim())
-      .filter(Boolean);
+      ? itemFormData.models.split(/[,;\n]+/).map(m => m.trim()).filter(Boolean)
+      : [];
+
+    const preservedBuyPrice =
+      editingItem && userRole !== 'main_admin'
+        ? editingItem.price || 0
+        : parseFloat(String(itemFormData.price)) || 0;
 
     const newItem: InventoryItem = {
-      id: itemId,
-      category: itemFormData.category.trim(),
-      brand: itemFormData.brand.trim(),
+      id: targetId,
+      _fbKey: safeFbKey,
+      category: itemFormData.category.trim() || 'Display',
+      brand: itemFormData.brand.trim() || 'General',
       name: itemFormData.name.trim(),
       models: modelsArr,
       stock: parseInt(String(itemFormData.stock)) || 0,
-      price: parseFloat(String(itemFormData.price)) || 0,
+      price: preservedBuyPrice,
       sellingPrice: parseFloat(String(itemFormData.sellingPrice)) || 0,
-      sku: itemFormData.sku ? itemFormData.sku.trim() : undefined,
+      sku: itemFormData.sku ? itemFormData.sku.trim() : '',
       updatedAt: new Date().toLocaleDateString('en-GB')
     };
 
-    set(ref(rtdb, 'inventory/' + itemId), newItem);
+    // Optimistic local update & LocalStorage persistence
+    setInventory(prev => {
+      const idx = prev.findIndex(i => (editingItem && (i.id === editingItem.id || (editingItem._fbKey && i._fbKey === editingItem._fbKey))) || i.id === targetId || i._fbKey === safeFbKey);
+      let next: InventoryItem[];
+      if (idx >= 0) {
+        next = [...prev];
+        next[idx] = newItem;
+      } else {
+        next = [newItem, ...prev];
+      }
+      saveLocal('anik_pos_inventory_v1', next);
+      return next;
+    });
+
+    set(ref(rtdb, 'inventory/' + safeFbKey), sanitizeForFirebase(newItem))
+      .then(() => {
+        showToast(editingItem ? `'${newItem.name}' সফলভাবে আপডেট হয়েছে! ✅` : `'${newItem.name}' স্টকে যুক্ত হয়েছে! ✅`, 'success');
+      })
+      .catch(err => {
+        console.warn('Firebase error, saved in local cache:', err);
+        showToast(editingItem ? `'${newItem.name}' লোকাল মেমরিতে সংরক্ষিত হয়েছে! ✅` : `'${newItem.name}' স্টকে যুক্ত হয়েছে! ✅`, 'success');
+      });
+
     setIsItemModalOpen(false);
+  };
+
+  // Direct Save / Update Item (used by BarcodeScannerModal and quick action forms)
+  const handleDirectSaveItem = async (itemToSave: InventoryItem): Promise<InventoryItem> => {
+    const targetId = itemToSave.id || ('item_' + Date.now());
+    const safeFbKey = String(itemToSave._fbKey || targetId).replace(/[.#$[\]/]/g, '_');
+    
+    const finalItem: InventoryItem = {
+      ...itemToSave,
+      id: targetId,
+      _fbKey: safeFbKey,
+      updatedAt: new Date().toLocaleDateString('en-GB')
+    };
+
+    setInventory(prev => {
+      const idx = prev.findIndex(i => i.id === targetId || (itemToSave._fbKey && i._fbKey === itemToSave._fbKey) || i._fbKey === safeFbKey);
+      let next: InventoryItem[];
+      if (idx >= 0) {
+        next = [...prev];
+        next[idx] = finalItem;
+      } else {
+        next = [finalItem, ...prev];
+      }
+      saveLocal('anik_pos_inventory_v1', next);
+      return next;
+    });
+
+    try {
+      await set(ref(rtdb, 'inventory/' + safeFbKey), sanitizeForFirebase(finalItem));
+      showToast(`'${finalItem.name}' সফলভাবে সেভ ও ফায়ারবেসে সংরক্ষিত হয়েছে! ✅`, 'success');
+    } catch (err) {
+      console.warn('Firebase error, saved locally:', err);
+      showToast(`'${finalItem.name}' লোকাল মেমরিতে সংরক্ষিত হয়েছে! ✅`, 'success');
+    }
+
+    return finalItem;
+  };
+
+  // Direct Update SKU for an existing item (assign scanned barcode to item)
+  const handleUpdateItemSku = async (itemId: string, newSku: string): Promise<InventoryItem | null> => {
+    const existing = inventory.find(i => i.id === itemId || i._fbKey === itemId);
+    if (!existing) return null;
+
+    const targetKey = String(existing._fbKey || existing.id).replace(/[.#$[\]/]/g, '_');
+    const updatedItem: InventoryItem = {
+      ...existing,
+      id: existing.id || targetKey,
+      _fbKey: targetKey,
+      sku: newSku.trim(),
+      updatedAt: new Date().toLocaleDateString('en-GB')
+    };
+
+    setInventory(prev => {
+      const next = prev.map(i => (i.id === itemId || i._fbKey === itemId) ? updatedItem : i);
+      saveLocal('anik_pos_inventory_v1', next);
+      return next;
+    });
+
+    try {
+      // Save entire item with new SKU to ensure full document persistence in Firebase
+      await set(ref(rtdb, 'inventory/' + targetKey), sanitizeForFirebase(updatedItem));
+      showToast(`'${existing.name}' এর বারকোড (${newSku}) সফলভাবে সেভ ও ফায়ারবেসে আপডেট হয়েছে! ✅`, 'success');
+    } catch (err) {
+      console.warn('Firebase sku update error, saved locally:', err);
+      showToast(`'${existing.name}' এর বারকোড লোকাল স্টোরেজে সেভ হয়েছে! ✅`, 'success');
+    }
+
+    return updatedItem;
   };
 
   const handleDeleteItem = (itemId: string, itemName: string) => {
     if (userRole !== 'main_admin') {
-      alert('অনুমতি নেই!');
+      showToast('শুধুমাত্র Main Admin (Anik) মালামাল ডিলিট করতে পারবেন!', 'error');
       return;
     }
     if (confirm(`'${itemName}' আইটেমটি স্টক থেকে চিরতরে মুছে ফেলতে চান?`)) {
-      remove(ref(rtdb, 'inventory/' + itemId));
+      setInventory(prev => {
+        const next = prev.filter(i => i.id !== itemId);
+        saveLocal('anik_pos_inventory_v1', next);
+        return next;
+      });
+      const safeKey = String(itemId).replace(/[.#$[\]/]/g, '_');
+      remove(ref(rtdb, 'inventory/' + safeKey)).catch(() => {});
+      showToast(`'${itemName}' মুছে ফেলা হয়েছে`, 'info');
     }
   };
 
   // Quick Stock Adjustment (+1, +5)
   const handleQuickStockAdjust = (item: InventoryItem, delta: number) => {
-    if (userRole !== 'main_admin') {
-      setIsLoginModalOpen(true);
-      return;
-    }
     const newStock = Math.max(0, (item.stock || 0) + delta);
-    update(ref(rtdb, 'inventory/' + item.id), { stock: newStock });
+    setInventory(prev => {
+      const next = prev.map(i => i.id === item.id ? { ...i, stock: newStock } : i);
+      saveLocal('anik_pos_inventory_v1', next);
+      return next;
+    });
+    const safeKey = String(item._fbKey || item.id).replace(/[.#$[\]/]/g, '_');
+    update(ref(rtdb, 'inventory/' + safeKey), { stock: newStock }).catch(() => {});
+    showToast(`${item.name}: স্টক ${delta > 0 ? '+' + delta : delta} (${newStock} পিস)`, 'success');
   };
 
   // Open Sell Modal
   const handleOpenSell = (item: InventoryItem) => {
     if (item.stock <= 0) {
-      alert('এই আইটেমটির স্টক খালি (০ পিস)! বিক্রি করা যাবে না।');
+      showToast('এই আইটেমটির স্টক খালি (০ পিস)! বিক্রি করা যাবে না।', 'error');
       return;
     }
     setSellingItem(item);
-    setSellQty(1);
-    setSellPrice(item.sellingPrice || 0);
+    setSellQty('1');
+    setSellPrice(item.sellingPrice ? String(item.sellingPrice) : '');
     setSellIsBaki(false);
     setSellCustomerName('');
     setSellCustomerPhone('');
-    setSellPaidNow(0);
+    setSellPaidNow('');
     setIsSellModalOpen(true);
+  };
+
+  // Cart Handlers
+  const handleAddToCart = (item: InventoryItem) => {
+    if (item.stock <= 0) {
+      showToast(`'${item.name}' আউট অফ স্টক (০ পিস)!`, 'error');
+      return;
+    }
+    setCart(prev => {
+      const idx = prev.findIndex(ci => ci.item.id === item.id);
+      if (idx >= 0) {
+        if (prev[idx].qty >= (item.stock || 1)) {
+          showToast(`স্টকে সর্বোচ্চ ${item.stock} টি আছে!`, 'error');
+          return prev;
+        }
+        const updated = [...prev];
+        updated[idx] = { ...updated[idx], qty: updated[idx].qty + 1 };
+        showToast(`'${item.name}' কার্টে পরিমাণ বাড়ানো হয়েছে (${updated[idx].qty})! 🛒`, 'success');
+        return updated;
+      }
+      showToast(`'${item.name}' কার্টে যোগ হয়েছে! 🛒`, 'success');
+      return [...prev, { item, qty: 1, price: item.sellingPrice || 0 }];
+    });
+  };
+
+  const handleUpdateCartQty = (itemId: string, delta: number) => {
+    setCart(prev =>
+      prev
+        .map(ci => {
+          if (ci.item.id === itemId) {
+            const maxStock = ci.item.stock || 1;
+            const newQty = Math.max(1, Math.min(maxStock, ci.qty + delta));
+            return { ...ci, qty: newQty };
+          }
+          return ci;
+        })
+        .filter(ci => ci.qty > 0)
+    );
+  };
+
+  const handleRemoveCartItem = (itemId: string) => {
+    setCart(prev => prev.filter(ci => ci.item.id !== itemId));
+    showToast('আইটেমটি কার্ট থেকে বাদ দেওয়া হয়েছে', 'info');
+  };
+
+  const handleClearCart = () => {
+    setCart([]);
+    showToast('কার্ট সম্পূর্ণ খালি করা হয়েছে', 'info');
+  };
+
+  const handleCartCheckout = (checkoutData: {
+    cart: CartItem[];
+    customerName: string;
+    customerPhone: string;
+    discount: number;
+    paidAmount: number;
+    isBaki: boolean;
+    note: string;
+  }) => {
+    const todayStr = new Date().toLocaleDateString('en-GB');
+    const { cart: cartItems, customerName: cName, customerPhone: cPhone, discount: disc, paidAmount: paidNow, isBaki: bakiChecked } = checkoutData;
+
+    if (cartItems.length === 0) return;
+
+    let cartSubtotal = 0;
+    const receiptItems: { name: string; qty: number; rate: number; amount: number }[] = [];
+
+    cartItems.forEach(ci => {
+      const lineTotal = ci.qty * ci.price;
+      cartSubtotal += lineTotal;
+      receiptItems.push({
+        name: `${ci.item.name} (${ci.item.brand})`,
+        qty: ci.qty,
+        rate: ci.price,
+        amount: lineTotal
+      });
+
+      const remainingStock = Math.max(0, (ci.item.stock || 0) - ci.qty);
+      setInventory(prev => {
+        const next = prev.map(i => i.id === ci.item.id ? { ...i, stock: remainingStock } : i);
+        saveLocal('anik_pos_inventory_v1', next);
+        return next;
+      });
+      const safeKey = String(ci.item._fbKey || ci.item.id).replace(/[.#$[\]/]/g, '_');
+      update(ref(rtdb, 'inventory/' + safeKey), { stock: remainingStock }).catch(() => {});
+
+      const sId = 'sale_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+      const saleRec: SaleRecord = {
+        id: sId,
+        itemId: ci.item.id,
+        name: ci.item.name,
+        qty: ci.qty,
+        buy: ci.item.price || 0,
+        sell: ci.price,
+        seller: activeSeller,
+        date: todayStr,
+        isBaki: bakiChecked
+      };
+      if (cName) saleRec.customerName = cName;
+      if (cPhone) saleRec.customerPhone = cPhone;
+      setSalesHistory(prev => {
+        const next = [saleRec, ...prev];
+        saveLocal('anik_pos_sales_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'salesHistory/' + sId), sanitizeForFirebase(saleRec)).catch(() => {});
+    });
+
+    const finalBill = Math.max(0, cartSubtotal - (disc || 0));
+    const finalPaid = bakiChecked ? Math.min(finalBill, paidNow) : finalBill;
+    const dueLeft = Math.max(0, finalBill - finalPaid);
+
+    if (bakiChecked && dueLeft > 0) {
+      const debtorName = cName || 'কাস্টমার';
+      const existing = duesData.find(d => 
+        (cPhone && d.phone === cPhone) || 
+        (d.name.toLowerCase() === debtorName.toLowerCase())
+      );
+
+      const itemsDesc = cartItems.map(ci => `${ci.item.name} x${ci.qty}`).join(', ');
+
+      if (existing) {
+        const newTotal = (existing.totalAmount || 0) + finalBill;
+        const newPaidTotal = (existing.paidAmount || 0) + finalPaid;
+        const newHist = existing.history ? [...existing.history] : [];
+        newHist.push({
+          date: todayStr,
+          type: 'due',
+          amount: finalBill,
+          note: `কার্ট বিল: ${itemsDesc}`,
+          seller: activeSeller
+        });
+        if (finalPaid > 0) {
+          newHist.push({
+            date: todayStr,
+            type: 'payment',
+            amount: finalPaid,
+            note: 'কার্ট ক্রয়ের সময় নগদ জমা',
+            seller: activeSeller
+          });
+        }
+        update(ref(rtdb, 'duesData/' + existing.id), sanitizeForFirebase({
+          totalAmount: newTotal,
+          paidAmount: newPaidTotal,
+          history: newHist,
+          updatedAt: todayStr
+        }));
+      } else {
+        const newDueId = 'due_' + Date.now();
+        const newDueRec: CustomerDue = {
+          id: newDueId,
+          name: debtorName,
+          phone: cPhone || '',
+          note: `কার্ট বিল: ${itemsDesc}`,
+          totalAmount: finalBill,
+          paidAmount: finalPaid,
+          seller: activeSeller,
+          date: todayStr,
+          history: [
+            {
+              date: todayStr,
+              type: 'due',
+              amount: finalBill,
+              note: `কার্ট বিল: ${itemsDesc}`,
+              seller: activeSeller
+            },
+            ...(finalPaid > 0 ? [{
+              date: todayStr,
+              type: 'payment' as const,
+              amount: finalPaid,
+              note: 'কার্ট ক্রয়ের সময় নগদ জমা',
+              seller: activeSeller
+            }] : [])
+          ]
+        };
+        set(ref(rtdb, 'duesData/' + newDueId), sanitizeForFirebase(newDueRec));
+      }
+    }
+
+    setReceiptData({
+      title: 'ক্যাশ মেমো / বিক্রয় রসিদ (POS)',
+      type: 'sale',
+      date: todayStr,
+      customerName: cName || undefined,
+      customerPhone: cPhone || undefined,
+      items: receiptItems,
+      subtotal: finalBill,
+      paid: finalPaid,
+      due: dueLeft,
+      seller: activeSeller,
+      note: disc > 0 ? `ছাড়: ৳${disc}` : undefined
+    });
+
+    setCart([]);
+    const cartSaleId = 'cart_sale_' + Date.now();
+    knownSaleIds.current.add(cartSaleId);
+    triggerSaleNotification({
+      id: cartSaleId,
+      name: cartItems.length === 1 ? cartItems[0].item.name : `${cartItems[0].item.name} সহ মোট ${cartItems.length} টি পার্টস`,
+      qty: cartItems.reduce((acc, c) => acc + c.qty, 0),
+      total: finalBill,
+      seller: activeSeller,
+      isBaki: bakiChecked && dueLeft > 0
+    });
+    showToast(`কার্টের ${cartItems.length} টি পার্টস বিক্রি সম্পন্ন হয়েছে! মোট ৳${finalBill}`, 'success');
+  };
+
+  // CSV Export Handlers
+  const handleExportCSVInventory = () => {
+    const headers = ['ID', 'পার্টসের নাম', 'ক্যাটেগরি', 'ব্র্যান্ড', 'স্টক (পিস)', 'কেনা দাম (৳)', 'বিক্রয় দাম (৳)', 'মোট স্টক মূল্য', 'SKU'];
+    const rows = inventory.map(item => [
+      item.id,
+      item.name,
+      item.category,
+      item.brand,
+      item.stock,
+      item.price || 0,
+      item.sellingPrice || 0,
+      (item.stock || 0) * (item.price || 0),
+      item.sku || ''
+    ]);
+    exportToCSV('Anik_Telecom_Inventory_Stock', headers, rows);
+    showToast('স্টক ইনভেন্টরি Excel/CSV ফাইল ডাউনলোড হয়েছে! 📊', 'success');
+  };
+
+  const handleExportCSVSales = () => {
+    const headers = ['বিক্রয় ID', 'তারিখ', 'পার্টসের নাম', 'পরিমাণ', 'কেনা মূল্য (৳)', 'বিক্রয় মূল্য (৳)', 'লাভ (৳)', 'কাস্টমার', 'মোবাইল', 'ধরন', 'অপারেটর'];
+    const rows = salesHistory.map(sale => [
+      sale.id,
+      sale.date,
+      sale.name,
+      sale.qty,
+      sale.buy,
+      sale.sell,
+      (sale.qty || 1) * ((sale.sell || 0) - (sale.buy || 0)),
+      sale.customerName || 'কাস্টমার',
+      sale.customerPhone || '',
+      sale.isBaki ? 'বাকি' : 'নগদ',
+      sale.seller || ''
+    ]);
+    exportToCSV('Anik_Telecom_Sales_History', headers, rows);
+    showToast('বিক্রয় হিস্ট্রি Excel/CSV ফাইল ডাউনলোড হয়েছে! 📊', 'success');
+  };
+
+  const handleExportCSVDues = () => {
+    const headers = ['কাস্টমার ID', 'তারিখ', 'গ্রাহকের নাম', 'মোবাইল', 'মোট বাকি (৳)', 'মোট জমা (৳)', 'অবশিষ্ট বকেয়া (৳)', 'স্ট্যাটাস', 'অপারেটর'];
+    const rows = duesData.map(due => {
+      const remaining = Math.max(0, due.totalAmount - (due.paidAmount || 0));
+      return [
+        due.id,
+        due.date,
+        due.name,
+        due.phone || '',
+        due.totalAmount,
+        due.paidAmount || 0,
+        remaining,
+        remaining === 0 ? 'পরিশোধিত' : 'বকেয়া',
+        due.seller || ''
+      ];
+    });
+    exportToCSV('Anik_Telecom_Baki_Khata', headers, rows);
+    showToast('বাকি খাতা Excel/CSV ফাইল ডাউনলোড হয়েছে! 📊', 'success');
   };
 
   const handleConfirmSale = (e: React.FormEvent) => {
@@ -771,7 +2388,7 @@ export default function App() {
 
     const qty = parseInt(String(sellQty)) || 1;
     if (qty > sellingItem.stock) {
-      alert(`স্টকের পরিমাণের চেয়ে বেশি বিক্রি করা যাবে না! স্টকে আছে: ${sellingItem.stock} টি।`);
+      showToast(`স্টকের পরিমাণের চেয়ে বেশি বিক্রি করা যাবে না! স্টকে আছে: ${sellingItem.stock} টি।`, 'error');
       return;
     }
 
@@ -792,17 +2409,46 @@ export default function App() {
       sell: unitPrice,
       seller: activeSeller,
       date: todayStr,
-      customerName: sellCustomerName.trim() || undefined,
-      customerPhone: sellCustomerPhone.trim() || undefined,
-      isBaki: sellIsBaki,
-      warranty: sellWarranty !== 'কোনো ওয়ারেন্টি নেই' ? sellWarranty : undefined
+      isBaki: sellIsBaki
     };
-    set(ref(rtdb, 'salesHistory/' + saleId), saleRecord);
+    if (sellCustomerName?.trim()) {
+      saleRecord.customerName = sellCustomerName.trim();
+    }
+    if (sellCustomerPhone?.trim()) {
+      saleRecord.customerPhone = sellCustomerPhone.trim();
+    }
+    if (sellWarranty && sellWarranty !== 'কোনো ওয়ারেন্টি নেই') {
+      saleRecord.warranty = sellWarranty;
+    }
+    setSalesHistory(prev => {
+      const next = [saleRecord, ...prev];
+      saveLocal('anik_pos_sales_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'salesHistory/' + saleId), sanitizeForFirebase(saleRecord)).catch(() => {});
 
     // 2. Deduct Stock
-    update(ref(rtdb, 'inventory/' + sellingItem.id), {
-      stock: (sellingItem.stock || 0) - qty
+    setInventory(prev => {
+      const next = prev.map(i => i.id === sellingItem.id ? { ...i, stock: Math.max(0, (i.stock || 0) - qty) } : i);
+      saveLocal('anik_pos_inventory_v1', next);
+      return next;
     });
+    const safeKey = String(sellingItem._fbKey || sellingItem.id).replace(/[.#$[\]/]/g, '_');
+    update(ref(rtdb, 'inventory/' + safeKey), {
+      stock: Math.max(0, (sellingItem.stock || 0) - qty)
+    }).catch(() => {});
+
+    knownSaleIds.current.add(saleId);
+    triggerSaleNotification({
+      id: saleId,
+      name: sellingItem.name,
+      qty: qty,
+      total: totalBill,
+      seller: activeSeller,
+      isBaki: sellIsBaki
+    });
+
+    showToast(`'${sellingItem.name}' (x${qty}) বিক্রি সম্পন্ন হয়েছে! ৳${totalBill}`, 'success');
 
     // 3. Handle Baki integration if checked
     if (sellIsBaki && dueAmount > 0) {
@@ -839,19 +2485,19 @@ export default function App() {
           });
         }
 
-        update(ref(rtdb, 'duesData/' + existing.id), {
+        update(ref(rtdb, 'duesData/' + existing.id), sanitizeForFirebase({
           totalAmount: updatedTotal,
           paidAmount: updatedPaid,
           history: newHistory,
           updatedAt: todayStr
-        });
+        }));
       } else {
         // Create new customer due record
         const dueId = 'due_' + Date.now();
         const newDueRecord: CustomerDue = {
           id: dueId,
           name: custName,
-          phone: custPhone,
+          phone: custPhone || '',
           note: `${sellingItem.name} (পরিমাণ: ${qty})`,
           totalAmount: totalBill,
           paidAmount: paid,
@@ -874,7 +2520,7 @@ export default function App() {
             }] : [])
           ]
         };
-        set(ref(rtdb, 'duesData/' + dueId), newDueRecord);
+        set(ref(rtdb, 'duesData/' + dueId), sanitizeForFirebase(newDueRecord));
       }
     }
 
@@ -903,33 +2549,127 @@ export default function App() {
     setIsSellModalOpen(false);
   };
 
-  // Open Service Modal
+  // Open / Edit / Delete Service & Load Modal
+  const handleOpenAddService = () => {
+    setEditingService(null);
+    setServiceFormData({
+      type: 'Recharge/Flexiload',
+      desc: '',
+      cost: '',
+      paid: '',
+      customerName: '',
+      customerPhone: '',
+      isBaki: false,
+      date: new Date().toLocaleDateString('en-GB')
+    });
+    setIsServiceModalOpen(true);
+  };
+
+  const handleOpenEditService = (srv: ServiceRecord) => {
+    setEditingService(srv);
+    setServiceFormData({
+      type: srv.type || 'Recharge/Flexiload',
+      desc: srv.desc || '',
+      cost: srv.cost !== undefined && srv.cost !== null ? String(srv.cost) : '0',
+      paid: srv.paid !== undefined && srv.paid !== null ? String(srv.paid) : '0',
+      customerName: srv.customerName || '',
+      customerPhone: srv.customerPhone || '',
+      isBaki: false,
+      date: srv.date || new Date().toLocaleDateString('en-GB')
+    });
+    setIsServiceModalOpen(true);
+  };
+
+  const handleDeleteService = (srv: ServiceRecord) => {
+    if (confirm(`'${srv.desc || srv.type}' সার্ভিস/লোড এন্ট্রিটি মুছে ফেলতে চান?`)) {
+      const safeKey = String(srv._fbKey || srv.id).replace(/[.#$[\]/]/g, '_');
+      setServicesData(prev => {
+        const next = prev.filter(s => s.id !== srv.id && s._fbKey !== safeKey);
+        saveLocal('anik_pos_services_v1', next);
+        return next;
+      });
+      remove(ref(rtdb, 'servicesData/' + safeKey)).catch(() => {});
+      showToast('সার্ভিস ও লোড এন্ট্রি মুছে ফেলা হয়েছে', 'info');
+    }
+  };
+
   const handleSaveService = (e: React.FormEvent) => {
     e.preventDefault();
-    if (userRole === 'guest') {
-      alert('সার্ভিস এন্ট্রি করার জন্য লগইন করুন!');
-      setIsLoginModalOpen(true);
+
+    const cost = parseFloat(String(serviceFormData.cost)) || 0;
+    const paid = parseFloat(String(serviceFormData.paid)) || 0;
+    const todayStr = (serviceFormData.date && serviceFormData.date.trim())
+      ? serviceFormData.date.trim()
+      : (editingService?.date || new Date().toLocaleDateString('en-GB'));
+
+    if (editingService) {
+      const targetId = editingService.id || ('srv_' + Date.now());
+      const safeKey = String(editingService._fbKey || targetId).replace(/[.#$[\]/]/g, '_');
+      const updatedRecord: ServiceRecord = {
+        id: targetId,
+        _fbKey: safeKey,
+        type: serviceFormData.type,
+        desc: serviceFormData.desc.trim(),
+        cost: cost,
+        paid: paid,
+        seller: editingService.seller || activeSeller,
+        date: todayStr
+      };
+      if (serviceFormData.customerName?.trim()) {
+        updatedRecord.customerName = serviceFormData.customerName.trim();
+      }
+      if (serviceFormData.customerPhone?.trim()) {
+        updatedRecord.customerPhone = serviceFormData.customerPhone.trim();
+      }
+
+      setServicesData(prev => {
+        const next = prev.map(s => (s.id === editingService.id || (editingService._fbKey && s._fbKey === editingService._fbKey) || s._fbKey === safeKey) ? updatedRecord : s);
+        saveLocal('anik_pos_services_v1', next);
+        return next;
+      });
+      set(ref(rtdb, 'servicesData/' + safeKey), sanitizeForFirebase(updatedRecord)).catch(() => {});
+      showToast(`'${updatedRecord.desc || updatedRecord.type}' সার্ভিস ও লোড এন্ট্রি সফলভাবে আপডেট হয়েছে! ✅`, 'success');
+
+      setIsServiceModalOpen(false);
+      setEditingService(null);
+      setServiceFormData({
+        type: 'Recharge/Flexiload',
+        desc: '',
+        cost: '',
+        paid: '',
+        customerName: '',
+        customerPhone: '',
+        isBaki: false,
+        date: ''
+      });
       return;
     }
 
     const srvId = 'srv_' + Date.now();
-    const cost = parseFloat(String(serviceFormData.cost)) || 0;
-    const paid = parseFloat(String(serviceFormData.paid)) || 0;
-    const todayStr = new Date().toLocaleDateString('en-GB');
-
     const serviceRecord: ServiceRecord = {
       id: srvId,
+      _fbKey: srvId,
       type: serviceFormData.type,
       desc: serviceFormData.desc.trim(),
       cost: cost,
       paid: paid,
       seller: activeSeller,
-      date: todayStr,
-      customerName: serviceFormData.customerName.trim() || undefined,
-      customerPhone: serviceFormData.customerPhone.trim() || undefined
+      date: todayStr
     };
+    if (serviceFormData.customerName?.trim()) {
+      serviceRecord.customerName = serviceFormData.customerName.trim();
+    }
+    if (serviceFormData.customerPhone?.trim()) {
+      serviceRecord.customerPhone = serviceFormData.customerPhone.trim();
+    }
 
-    set(ref(rtdb, 'servicesData/' + srvId), serviceRecord);
+    setServicesData(prev => {
+      const next = [serviceRecord, ...prev];
+      saveLocal('anik_pos_services_v1', next);
+      return next;
+    });
+    set(ref(rtdb, 'servicesData/' + srvId), sanitizeForFirebase(serviceRecord)).catch(() => {});
+    showToast(`'${serviceRecord.type}' সার্ভিস রেকর্ড সফলভাবে সেভ হয়েছে! ✅`, 'success');
 
     // If customer has due on service
     if (serviceFormData.isBaki && paid < cost) {
@@ -937,7 +2677,7 @@ export default function App() {
       const newDue: CustomerDue = {
         id: dueId,
         name: serviceFormData.customerName.trim() || 'সার্ভিস কাস্টমার',
-        phone: serviceFormData.customerPhone.trim(),
+        phone: serviceFormData.customerPhone.trim() || '',
         note: `সার্ভিস: ${serviceFormData.type} - ${serviceFormData.desc}`,
         totalAmount: cost,
         paidAmount: paid,
@@ -960,7 +2700,7 @@ export default function App() {
           }] : [])
         ]
       };
-      set(ref(rtdb, 'duesData/' + dueId), newDue);
+      set(ref(rtdb, 'duesData/' + dueId), sanitizeForFirebase(newDue)).catch(() => {});
     }
 
     // Generate Receipt
@@ -983,14 +2723,16 @@ export default function App() {
     });
 
     setIsServiceModalOpen(false);
+    setEditingService(null);
     setServiceFormData({
       type: 'Recharge/Flexiload',
       desc: '',
-      cost: 0,
-      paid: 0,
+      cost: '',
+      paid: '',
       customerName: '',
       customerPhone: '',
-      isBaki: false
+      isBaki: false,
+      date: ''
     });
   };
 
@@ -1033,14 +2775,22 @@ export default function App() {
         });
       }
 
-      update(ref(rtdb, 'duesData/' + existing.id), {
+      setDuesData(prev => prev.map(d => d.id === existing.id ? {
+        ...d,
         totalAmount: newTotal,
         paidAmount: newPaid,
         history: updatedHistory,
         updatedAt: todayStr
-      });
+      } : d));
 
-      alert(`'${existing.name}'-এর হিসাবে সফলভাবে ৳${dueData.amount} বাকি যুক্ত হয়েছে! ✅`);
+      update(ref(rtdb, 'duesData/' + existing.id), sanitizeForFirebase({
+        totalAmount: newTotal,
+        paidAmount: newPaid,
+        history: updatedHistory,
+        updatedAt: todayStr
+      }));
+
+      showToast(`'${existing.name}'-এর হিসাবে ৳${dueData.amount} বাকি যুক্ত হয়েছে! ✅`, 'success');
     } else {
       // Brand NEW customer
       const dueId = 'due_' + Date.now();
@@ -1068,7 +2818,7 @@ export default function App() {
         id: dueId,
         name: dueData.name,
         phone: dueData.phone || '',
-        note: dueData.note,
+        note: dueData.note || 'নতুন বাকি',
         totalAmount: dueData.amount,
         paidAmount: dueData.advancePaid || 0,
         seller: activeSeller,
@@ -1076,8 +2826,9 @@ export default function App() {
         history: historyList
       };
 
-      set(ref(rtdb, 'duesData/' + dueId), newDue);
-      alert(`'${dueData.name}'-এর নতুন বাকির খাতা তৈরি হয়েছে! ✅`);
+      setDuesData(prev => [newDue, ...prev]);
+      set(ref(rtdb, 'duesData/' + dueId), sanitizeForFirebase(newDue));
+      showToast(`'${dueData.name}'-এর নতুন বাকির খাতা তৈরি হয়েছে! ✅`, 'success');
     }
 
     setDuePreselectedCustomer(null);
@@ -1099,11 +2850,20 @@ export default function App() {
     };
     const updatedHistory = target.history ? [...target.history, historyItem] : [historyItem];
 
-    update(ref(rtdb, 'duesData/' + target.id), {
+    setDuesData(prev => prev.map(d => d.id === target.id ? {
+      ...d,
       paidAmount: newPaidAmount,
       history: updatedHistory,
       updatedAt: todayStr
-    });
+    } : d));
+
+    update(ref(rtdb, 'duesData/' + target.id), sanitizeForFirebase({
+      paidAmount: newPaidAmount,
+      history: updatedHistory,
+      updatedAt: todayStr
+    }));
+
+    showToast(`'${target.name}'-এর কাছ থেকে ৳${amount} টাকা জমা নেওয়া হয়েছে! ✅`, 'success');
 
     const residualDue = Math.max(0, target.totalAmount - newPaidAmount);
 
@@ -1130,10 +2890,11 @@ export default function App() {
   // Delete customer record (Admin)
   const handleDeleteDueCustomer = (customerId: string) => {
     if (userRole !== 'main_admin') {
-      alert('শুধুমাত্র Main Admin বাকির খাতা ডিলিট করতে পারবেন!');
+      showToast('শুধুমাত্র Main Admin বাকির খাতা ডিলিট করতে পারবেন!', 'error');
       return;
     }
     remove(ref(rtdb, 'duesData/' + customerId));
+    showToast('কাস্টমারের বাকির খাতা ডিলিট করা হয়েছে', 'info');
   };
 
   // Statement print for customer
@@ -1159,19 +2920,17 @@ export default function App() {
   // WhatsApp Reminder
   const handleSendWhatsAppReminder = (cust: CustomerDue) => {
     if (!cust.phone) {
-      alert('গ্রাহকের মোবাইল নম্বর নেই!');
+      showToast('গ্রাহকের মোবাইল নম্বর নেই!', 'error');
       return;
     }
     const curDue = Math.max(0, cust.totalAmount - (cust.paidAmount || 0));
-    const cleanPhone = cust.phone.replace(/[^0-9]/g, '');
-    const intlPhone = cleanPhone.startsWith('0') ? '88' + cleanPhone : cleanPhone;
     
     let msg = `আসসালামু আলাইকুম ${cust.name} ভাই,\n`;
     msg += `অনিক টেলিকমে আপনার আগের ও বর্তমান বাকি মিলিয়ে মোট বকেয়া রয়েছে ৳${curDue} টাকা।\n`;
     msg += `দয়া করে দোকান বন্ধের আগে বা সুবিধাজনক সময়ে বকেয়া টাকা পরিশোধ করবেন।\n`;
     msg += `ধন্যবাদ - অনিক টেলিকম।`;
 
-    window.open(`https://wa.me/${intlPhone}?text=${encodeURIComponent(msg)}`, '_blank');
+    sendWhatsAppMessage(cust.phone, msg);
   };
 
   // Add New Seller
@@ -1273,9 +3032,9 @@ export default function App() {
         if (parsed.sellers) {
           set(ref(rtdb, 'sellers'), parsed.sellers);
         }
-        alert('ডেটাবেজ সফলভাবে ইমপোর্ট সম্পন্ন হয়েছে! ✅');
+        showToast('ডেটাবেজ সফলভাবে ইমপোর্ট সম্পন্ন হয়েছে! ✅', 'success');
       } catch {
-        alert('ভুল ফাইল! সঠিক JSON ফাইল আপলোড করুন। ❌');
+        showToast('ভুল ফাইল! সঠিক JSON ফাইল আপলোড করুন। ❌', 'error');
       }
       e.target.value = '';
     };
@@ -1284,220 +3043,507 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans pb-24">
-      {/* 1. Header */}
-      <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-md border-b border-slate-800 shadow-md px-4 py-3">
-        <div className="max-w-6xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3">
-          <div className="flex items-center justify-between w-full sm:w-auto">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-slate-950 shadow-md">
-                <Boxes className="w-5 h-5" />
+      {/* 1. Modern Header & Quick Tools Command Bar */}
+      <header className="sticky top-0 z-40 bg-slate-950/90 backdrop-blur-xl border-b border-slate-800/80 shadow-xl px-4 py-2.5">
+        <div className="max-w-6xl mx-auto space-y-2.5">
+          {/* Row 1: Brand Identity + Primary Action Dock + Operator/Auth */}
+          <div className="flex items-center justify-between gap-3">
+            {/* Brand Identity */}
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-slate-950 shadow-lg shadow-cyan-500/20 flex-shrink-0">
+                <Boxes className="w-5 h-5 stroke-[2.5]" />
               </div>
-              <div>
-                <h1 className="text-lg font-black tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-400">
-                  Anik Telecom
-                </h1>
-                <p className="text-[10px] text-slate-400 flex items-center gap-1.5">
-                  <span>মোবাইল সার্ভিসিং ও পার্টস শপ</span>
-                  <span className={`inline-block w-2 h-2 rounded-full ${isFirebaseConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} title={isFirebaseConnected ? 'অনলাইন সিঙ্ক সচল' : 'সিঙ্কিং...'} />
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <h1 className="text-base sm:text-lg font-black tracking-tight text-slate-100 truncate">
+                    {shopSettings.shopName || 'Anik Telecom'}
+                  </h1>
+                  <span
+                    className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${
+                      isFirebaseConnected ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                    }`}
+                    title={isFirebaseConnected ? 'অনলাইন সিঙ্ক সচল' : 'সিঙ্কিং...'}
+                  />
+                </div>
+                <p className="text-[11px] text-slate-400 truncate">
+                  {shopSettings.tagline || 'মোবাইল সার্ভিসিং ও পার্টস শপ'} · <span className="text-cyan-400 font-semibold">{activeSeller}</span>
                 </p>
               </div>
             </div>
 
-            {/* Mobile Header Quick Actions */}
+            {/* Mobile Quick Action Dock */}
             <div className="sm:hidden flex items-center gap-1.5">
-              <button
-                onClick={togglePrivacyMode}
-                className={`text-xs font-bold px-2.5 py-1.5 rounded-xl border flex items-center gap-1 shadow-sm active:scale-95 transition-all ${
-                  isPrivacyMode
-                    ? 'bg-amber-950/80 border-amber-500/50 text-amber-300'
-                    : 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
-                }`}
-                title={isPrivacyMode ? 'কেনা দাম গোপন (Customer Safe)' : 'কেনা দাম দৃশ্যমান (Owner)'}
-              >
-                {isPrivacyMode ? <EyeOff className="w-3.5 h-3.5 text-amber-400" /> : <Eye className="w-3.5 h-3.5 text-emerald-400" />}
-                <span className="text-[11px]">{isPrivacyMode ? 'গোপন' : 'উন্মুক্ত'}</span>
-              </button>
+              <div className="flex items-center bg-slate-900/90 border border-slate-800/90 p-1 rounded-2xl gap-1">
+                <button
+                  onClick={() => setIsBarcodeModalOpen(true)}
+                  className="p-2 rounded-xl text-cyan-400 hover:bg-slate-800 active:scale-95 transition-all"
+                  title="ক্যামেরা দিয়ে বারকোড স্ক্যান করুন"
+                >
+                  <ScanBarcode className="w-4 h-4" />
+                </button>
+
+                <button
+                  onClick={() => setIsCartModalOpen(true)}
+                  className={`relative p-2 rounded-xl flex items-center justify-center active:scale-95 transition-all ${
+                    cart.length > 0
+                      ? 'bg-cyan-500 text-slate-950 font-black shadow-sm'
+                      : 'text-slate-300 hover:bg-slate-800'
+                  }`}
+                  title="মাল্টি-আইটেম কার্ট"
+                >
+                  <ShoppingCart className="w-4 h-4" />
+                  {cart.length > 0 && (
+                    <span className="ml-1 text-[10px] font-mono font-black">
+                      {cart.length}
+                    </span>
+                  )}
+                </button>
+
+                <button
+                  onClick={() => setIsCashMemoStudioOpen(true)}
+                  className="p-2 rounded-xl text-amber-400 hover:bg-slate-800 active:scale-95 transition-all"
+                  title="প্রো ক্যাশ মেমো ও ইনভয়েস স্টুডিও"
+                >
+                  <FileText className="w-4 h-4" />
+                </button>
+
+                <button
+                  onClick={toggleSoundPreference}
+                  className={`p-2 rounded-xl flex items-center justify-center active:scale-95 transition-all ${
+                    isSoundEnabled ? 'text-emerald-400 bg-emerald-500/10' : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                  title={isSoundEnabled ? 'বিক্রি সাউন্ড সচল (মিউট করুন)' : 'সাউন্ড মিউট (চালু করুন)'}
+                >
+                  {isSoundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+                </button>
+
+                <button
+                  onClick={() => setIsSettingsModalOpen(true)}
+                  className="p-2 rounded-xl text-slate-300 hover:text-cyan-400 hover:bg-slate-800 active:scale-95 transition-all"
+                  title="দোকান সেটিংস ও সিস্টেম কনফিগারেশন"
+                >
+                  <Settings className="w-4 h-4 text-cyan-400" />
+                </button>
+
+                {isMainAdmin && (
+                  <button
+                    onClick={togglePrivacyMode}
+                    className={`p-2 rounded-xl flex items-center justify-center active:scale-95 transition-all ${
+                      isPrivacyMode ? 'text-amber-400 bg-amber-500/10' : 'text-emerald-400 bg-emerald-500/10'
+                    }`}
+                    title={isPrivacyMode ? 'কেনা দাম গোপন' : 'কেনা দাম উন্মুক্ত'}
+                  >
+                    {isPrivacyMode ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                )}
+              </div>
 
               <button
                 onClick={() => setIsMobileMenuOpen(true)}
-                className="p-1.5 rounded-xl bg-slate-900 border border-slate-800 text-slate-200 hover:text-cyan-400 active:scale-95 transition-all"
-                title="কুইক মেনু ও টুলস"
+                className="px-3 py-2 rounded-2xl bg-gradient-to-r from-cyan-500/20 to-blue-600/20 border border-cyan-500/40 text-cyan-300 font-bold text-xs flex items-center gap-1.5 active:scale-95 transition-all shadow-sm"
+                title="স্মার্ট টুলস মেনু"
               >
-                <Menu className="w-5 h-5" />
+                <Layers className="w-4 h-4 text-cyan-400" />
+                <span>টুলস</span>
               </button>
             </div>
-          </div>
 
-          {/* Desktop Navigation & Controls (hidden on mobile, cleanly arranged) */}
-          <div className="hidden sm:flex flex-wrap items-center gap-2 w-full sm:w-auto justify-end">
-            {/* Master Buying Price Privacy Toggle (Desktop & Tablet) */}
-            <button
-              onClick={togglePrivacyMode}
-              className={`hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm border ${
-                isPrivacyMode
-                  ? 'bg-amber-950/70 border-amber-500/50 text-amber-300 hover:bg-amber-900/60'
-                  : 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/60'
-              }`}
-              title={isPrivacyMode ? 'কাস্টমার মোড: সকল কেনা দাম গোপন (Privacy ON)' : 'ওনার মোড: কেনা দাম দৃশ্যমান (Owner ON)'}
-            >
-              {isPrivacyMode ? <EyeOff className="w-3.5 h-3.5 text-amber-400" /> : <Eye className="w-3.5 h-3.5 text-emerald-400" />}
-              <span>{isPrivacyMode ? '🔒 কেনা দাম গোপন' : '🔓 কেনা দাম উন্মুক্ত'}</span>
-            </button>
+            {/* Desktop Primary Controls & Operator Bar */}
+            <div className="hidden sm:flex items-center gap-2">
+              {/* Primary POS Action Dock */}
+              <div className="flex items-center bg-slate-900/90 border border-slate-800/90 p-1 rounded-2xl gap-1">
+                <button
+                  onClick={() => setIsBarcodeModalOpen(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-slate-200 hover:text-cyan-300 hover:bg-slate-800/80 transition-all"
+                  title="বারকোড ও এসকেইউ স্ক্যানার"
+                >
+                  <ScanBarcode className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>স্ক্যানার</span>
+                </button>
 
-            {/* Daily Cash Drawer Button */}
-            <button
-              onClick={() => setIsCashDrawerOpen(true)}
-              className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 hover:border-emerald-500/50 text-slate-300 hover:text-emerald-400 px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm"
-              title="আজকের ক্যাশ ড্রয়ার ও হিসাব মিলানো"
-            >
-              <DollarSign className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="hidden md:inline">ক্যাশ ড্রয়ার</span>
-            </button>
+                <button
+                  onClick={() => setIsCartModalOpen(true)}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                    cart.length > 0
+                      ? 'bg-cyan-500 text-slate-950 font-black shadow-sm'
+                      : 'text-slate-200 hover:text-cyan-300 hover:bg-slate-800/80'
+                  }`}
+                  title="মাল্টি-আইটেম কার্ট ও সেল এন্ট্রি"
+                >
+                  <ShoppingCart className={`w-3.5 h-3.5 ${cart.length > 0 ? 'text-slate-950' : 'text-cyan-400'}`} />
+                  <span>সেল কার্ট</span>
+                  {cart.length > 0 && (
+                    <span className="px-1.5 py-0.2 rounded-md bg-slate-950 text-cyan-400 text-[10px] font-mono font-black">
+                      {cart.length}
+                    </span>
+                  )}
+                </button>
 
-            {/* Wholesale Supplier / Mohajon Khata Button */}
-            <button
-              onClick={() => setIsSupplierModalOpen(true)}
-              className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 hover:border-purple-500/50 text-slate-300 hover:text-purple-400 px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm"
-              title="পাইকারি মহাজন ও সাপ্লায়ার খাতা"
-            >
-              <Building2 className="w-3.5 h-3.5 text-purple-400" />
-              <span className="hidden md:inline">মহাজন খাতা</span>
-              {supplierDues.length > 0 && (
-                <span className="text-[10px] bg-purple-950 text-purple-300 px-1.5 py-0.2 rounded-full font-mono">
-                  {supplierDues.length}
-                </span>
+                <button
+                  onClick={() => setIsCashMemoStudioOpen(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-500/15 text-amber-300 hover:bg-amber-500/25 border border-amber-500/30 transition-all"
+                  title="প্রো ক্যাশ মেমো ও কাস্টম ইনভয়েস স্টুডিও"
+                >
+                  <FileText className="w-3.5 h-3.5 text-amber-400" />
+                  <span>ক্যাশ মেমো</span>
+                </button>
+
+                <button
+                  onClick={() => setIsCalculatorOpen(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-slate-200 hover:text-cyan-300 hover:bg-slate-800/80 transition-all"
+                  title="দ্রুত ক্যাশ ক্যালকুলেটর"
+                >
+                  <Calculator className="w-3.5 h-3.5 text-cyan-400" />
+                  <span className="hidden lg:inline">ক্যালকুলেটর</span>
+                </button>
+
+                <button
+                  onClick={toggleSoundPreference}
+                  className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                    isSoundEnabled
+                      ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 border border-emerald-500/30'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/80'
+                  }`}
+                  title={isSoundEnabled ? 'বিক্রি সাউন্ড অন (ক্লিক করে মিউট করুন)' : 'সাউন্ড মিউট (ক্লিক করে চালু করুন)'}
+                >
+                  {isSoundEnabled ? <Volume2 className="w-3.5 h-3.5 text-emerald-400" /> : <VolumeX className="w-3.5 h-3.5 text-slate-500" />}
+                  <span className="hidden lg:inline">{isSoundEnabled ? 'সাউন্ড' : 'মিউট'}</span>
+                </button>
+
+                {isMainAdmin && (
+                  <button
+                    onClick={togglePrivacyMode}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                      isPrivacyMode
+                        ? 'bg-amber-500/15 text-amber-300 hover:bg-amber-500/25'
+                        : 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                    }`}
+                    title={isPrivacyMode ? 'কাস্টমার মোড: কেনা দাম গোপন' : 'ওনার মোড: কেনা দাম দৃশ্যমান'}
+                  >
+                    {isPrivacyMode ? <EyeOff className="w-3.5 h-3.5 text-amber-400" /> : <Eye className="w-3.5 h-3.5 text-emerald-400" />}
+                    <span>{isPrivacyMode ? 'গোপন' : 'উন্মুক্ত'}</span>
+                  </button>
+                )}
+              </div>
+
+              {/* Operator Selector */}
+              <div className="flex items-center bg-slate-900/90 border border-slate-800/90 rounded-2xl px-3 py-1.5 text-xs">
+                <span className="text-[11px] text-slate-400 mr-1.5">অপারেটর:</span>
+                {isMainAdmin ? (
+                  <>
+                    <select
+                      value={activeSeller}
+                      onChange={e => handleSellerChange(e.target.value)}
+                      className="bg-transparent font-bold text-cyan-400 focus:outline-none cursor-pointer text-xs"
+                    >
+                      {sellers.map((s, idx) => (
+                        <option key={`seller_opt_${s}_${idx}`} value={s} className="bg-slate-900 text-slate-200">
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      onClick={() => setIsSellerModalOpen(true)}
+                      className="ml-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-cyan-400 w-5 h-5 rounded-lg flex items-center justify-center text-xs font-bold transition-colors"
+                      title="নতুন অপারেটর যোগ করুন"
+                    >
+                      +
+                    </button>
+                  </>
+                ) : (
+                  <span className="font-bold text-cyan-400 text-xs">
+                    {isSubAdmin ? 'Parvej' : activeSeller}
+                  </span>
+                )}
+              </div>
+
+              {/* Push Notification Permission Button (if not yet granted) */}
+              {!isBrowserNotificationEnabled && (
+                <button
+                  onClick={handleEnableBrowserNotifications}
+                  className="hidden md:flex items-center gap-1.5 px-3 py-2 rounded-2xl bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-bold transition-all shadow-sm active:scale-95"
+                  title="কম্পিউটার বা মোবাইলে বিক্রির পুশ নোটিফিকেশন চালু করুন"
+                >
+                  <Bell className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>নোটিফিকেশন অন</span>
+                </button>
               )}
-            </button>
 
-            {/* Quick Profit Calculator */}
-            <button
-              onClick={() => setIsProfitCalcOpen(true)}
-              className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 hover:border-cyan-500/50 text-slate-300 hover:text-cyan-400 px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm"
-              title="লাভ ও ডিসকাউন্ট ক্যালকুলেটর"
-            >
-              <Percent className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="hidden sm:inline">লাভ হিসাব</span>
-            </button>
-
-            {/* Active Seller Select */}
-            <div className="flex items-center bg-slate-900 border border-slate-800 rounded-xl px-2 py-1 text-xs">
-              <span className="text-[10px] text-slate-500 font-bold mr-1.5">অপারেটর:</span>
-              <select
-                value={activeSeller}
-                onChange={e => handleSellerChange(e.target.value)}
-                className="bg-transparent font-bold text-cyan-400 focus:outline-none cursor-pointer text-xs"
+              {/* Prominent Modern Tools Menu Drawer Trigger */}
+              <button
+                onClick={() => setIsMobileMenuOpen(true)}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-2xl bg-gradient-to-r from-cyan-500/15 to-blue-600/15 hover:from-cyan-500 hover:to-blue-600 text-cyan-300 hover:text-slate-950 border border-cyan-500/35 text-xs font-black transition-all shadow-sm active:scale-95"
+                title="সমস্ত কুইক টুলস ও অপশন মেনু"
               >
-                {sellers.map((s, idx) => (
-                  <option key={`seller_opt_${s}_${idx}`} value={s} className="bg-slate-900 text-slate-200">
-                    {s}
-                  </option>
-                ))}
-              </select>
-              {userRole === 'main_admin' && (
-                <button
-                  onClick={() => setIsSellerModalOpen(true)}
-                  className="ml-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-cyan-400 w-5 h-5 rounded flex items-center justify-center text-xs font-bold transition-colors"
-                  title="নতুন অপারেটর প্রোফাইল যোগ করুন"
-                >
-                  +
-                </button>
-              )}
-            </div>
+                <Layers className="w-3.5 h-3.5" />
+                <span>টুলস মেনু</span>
+              </button>
 
-            {/* Quick Calculator Button */}
-            <button
-              onClick={() => setIsCalculatorOpen(true)}
-              className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 hover:border-cyan-500/50 text-slate-300 hover:text-cyan-400 px-2.5 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm"
-              title="দ্রুত ক্যাশ ও ফেরত টাকা ক্যালকুলেটর"
-            >
-              <Calculator className="w-3.5 h-3.5 text-cyan-400" />
-              <span className="hidden lg:inline">ক্যালকুলেটর</span>
-            </button>
+              {/* Shop Settings & System Configuration Trigger */}
+              <button
+                onClick={() => setIsSettingsModalOpen(true)}
+                className="flex items-center gap-1.5 px-3.5 py-2 rounded-2xl bg-slate-900/90 hover:bg-slate-800 text-slate-200 hover:text-cyan-300 border border-slate-800/90 text-xs font-bold transition-all shadow-sm active:scale-95"
+                title="দোকানের সেটিংস, প্রিন্ট রসিদ ও সিস্টেম কনফিগারেশন"
+              >
+                <Settings className="w-3.5 h-3.5 text-cyan-400" />
+                <span className="hidden xl:inline">সেটিংস</span>
+              </button>
 
-            {/* Auth Button on Desktop */}
-            <div className="hidden sm:block">
-              {userRole === 'guest' ? (
-                <button
-                  onClick={() => setIsLoginModalOpen(true)}
-                  className="flex items-center gap-1.5 bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500 hover:text-slate-950 px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm"
-                >
-                  <Lock className="w-3.5 h-3.5" />
-                  Admin Login
-                </button>
-              ) : (
-                <button
-                  onClick={handleLogout}
-                  className="flex items-center gap-1.5 bg-red-950/40 text-red-400 border border-red-900/50 hover:bg-red-900 hover:text-white px-3 py-1.5 rounded-xl text-xs font-bold transition-all shadow-sm"
-                >
-                  <Unlock className="w-3.5 h-3.5" />
-                  {userRole === 'main_admin' ? 'Main Admin Logout' : 'Sub Admin Logout'}
-                </button>
-              )}
+              {/* Auth / Role Switcher */}
+              <div className="flex items-center gap-1.5">
+                {userRole === 'guest' ? (
+                  <button
+                    onClick={() => setIsLoginModalOpen(true)}
+                    className="flex items-center gap-1.5 bg-cyan-500 text-slate-950 hover:bg-cyan-400 px-3.5 py-2 rounded-2xl text-xs font-black transition-all shadow-md"
+                  >
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>লগইন</span>
+                  </button>
+                ) : (
+                  <>
+                    {isSubAdmin && (
+                      <button
+                        onClick={() => {
+                          setSelectedLoginUser('Anik');
+                          setIsLoginModalOpen(true);
+                        }}
+                        className="flex items-center gap-1 bg-amber-500/15 text-amber-300 border border-amber-500/30 hover:bg-amber-500/25 px-3 py-2 rounded-2xl text-xs font-bold transition-all"
+                        title="মেইন অ্যাডমিন (Anik) এ লগইন করুন"
+                      >
+                        <Lock className="w-3.5 h-3.5" />
+                        <span className="hidden xl:inline">Anik Login</span>
+                      </button>
+                    )}
+                    <button
+                      onClick={handleLogout}
+                      className="flex items-center gap-1.5 bg-slate-900 hover:bg-red-950/60 text-slate-300 hover:text-red-300 border border-slate-800 hover:border-red-800/60 px-3 py-2 rounded-2xl text-xs font-bold transition-all"
+                      title="লগআউট করুন"
+                    >
+                      <Unlock className="w-3.5 h-3.5 text-red-400" />
+                      <span className="hidden lg:inline">{isMainAdmin ? 'Anik' : 'Parvej'}</span>
+                    </button>
+                  </>
+                )}
+              </div>
             </div>
           </div>
-        </div>
 
-        {/* Navigation Tabs */}
-        <div className="max-w-6xl mx-auto mt-3 flex items-center justify-between overflow-x-auto gap-2 border-t border-slate-800/80 pt-2.5">
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={() => setActiveTab('inventory')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold uppercase tracking-wider transition-all whitespace-nowrap ${
-                activeTab === 'inventory'
-                  ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 shadow-md shadow-cyan-500/20'
-                  : 'text-slate-400 hover:text-slate-200 bg-slate-900/60 hover:bg-slate-900'
-              }`}
-            >
-              <Boxes className="w-3.5 h-3.5" />
-              <span>Parts Stock</span>
-              <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-950/40 font-mono">
-                {inventory.length}
-              </span>
-            </button>
+          {/* Row 2: Modern Segmented Page Navigation + Sleek Quick Tools Bar */}
+          <div className="flex items-center justify-between gap-3 pt-2 border-t border-slate-800/60 overflow-x-auto no-scrollbar">
+            {/* Segmented Navigation Tabs */}
+            <div className="flex items-center bg-slate-900/80 border border-slate-800/80 p-1 rounded-2xl gap-1 flex-shrink-0">
+              <button
+                onClick={() => setActiveTab('home')}
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                  activeTab === 'home'
+                    ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black shadow-md shadow-cyan-500/20'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                }`}
+              >
+                <Home className="w-3.5 h-3.5" />
+                <span>হোম হাব</span>
+              </button>
 
-            <button
-              onClick={() => setActiveTab('services')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold uppercase tracking-wider transition-all whitespace-nowrap ${
-                activeTab === 'services'
-                  ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 shadow-md shadow-cyan-500/20'
-                  : 'text-slate-400 hover:text-slate-200 bg-slate-900/60 hover:bg-slate-900'
-              }`}
-            >
-              <Wrench className="w-3.5 h-3.5" />
-              <span>Services & Load</span>
-              <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-slate-950/40 font-mono">
-                {servicesData.length}
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('dues')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold uppercase tracking-wider transition-all whitespace-nowrap ${
-                activeTab === 'dues'
-                  ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-slate-950 shadow-md shadow-amber-500/20'
-                  : 'text-slate-400 hover:text-amber-300 bg-slate-900/60 hover:bg-slate-900'
-              }`}
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              <span>বাকি খাতা (Ledger)</span>
-              {duesSummary.debtorCount > 0 && (
-                <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-red-500 text-white font-mono font-bold animate-pulse">
-                  {duesSummary.debtorCount}
+              {/* Dedicated Mobile Parts Tab (আলাদা অপশন: শুধু মোবাইল পার্টস) */}
+              <button
+                onClick={() => setActiveTab('mobile_parts')}
+                className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                  activeTab === 'mobile_parts'
+                    ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black shadow-md shadow-cyan-500/20'
+                    : 'text-slate-400 hover:text-cyan-300 hover:bg-slate-800/60'
+                }`}
+              >
+                <Smartphone className="w-3.5 h-3.5" />
+                <span>মোবাইল পার্টস</span>
+                <span className={`text-[10px] font-mono font-bold ${
+                  activeTab === 'mobile_parts' ? 'text-slate-900 font-black' : 'text-cyan-400'
+                }`}>
+                  ({mobilePartsCount})
                 </span>
-              )}
-            </button>
+              </button>
 
-            <button
-              onClick={() => setActiveTab('dashboard')}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold uppercase tracking-wider transition-all whitespace-nowrap ${
-                activeTab === 'dashboard'
-                  ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 shadow-md shadow-cyan-500/20'
-                  : 'text-slate-400 hover:text-slate-200 bg-slate-900/60 hover:bg-slate-900'
-              }`}
-            >
-              <BarChart3 className="w-3.5 h-3.5" />
-              <span>Accounts & Reports</span>
-            </button>
+              <button
+                onClick={() => setActiveTab('inventory')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                  activeTab === 'inventory'
+                    ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black shadow-md shadow-cyan-500/20'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                }`}
+              >
+                <Boxes className="w-3.5 h-3.5" />
+                <span>{isSubAdmin ? 'স্টক ও সেল এন্ট্রি' : 'স্টক ও মালামাল'}</span>
+                <span className={`text-[10px] font-mono ${activeTab === 'inventory' ? 'text-slate-900 font-black' : 'text-slate-500'}`}>
+                  ({inventory.length})
+                </span>
+              </button>
+
+              {isMainAdmin && (
+                <button
+                  onClick={() => setActiveTab('services')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                    activeTab === 'services'
+                      ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black shadow-md shadow-cyan-500/20'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                  }`}
+                >
+                  <Wrench className="w-3.5 h-3.5" />
+                  <span>সার্ভিস ও লোড</span>
+                  <span className={`text-[10px] font-mono ${activeTab === 'services' ? 'text-slate-900 font-black' : 'text-slate-500'}`}>
+                    ({servicesData.length})
+                  </span>
+                </button>
+              )}
+
+              <button
+                onClick={() => setActiveTab('dues')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                  activeTab === 'dues'
+                    ? 'bg-gradient-to-r from-amber-500 to-amber-600 text-slate-950 font-black shadow-md shadow-amber-500/20'
+                    : 'text-slate-400 hover:text-amber-300 hover:bg-slate-800/60'
+                }`}
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>{isSubAdmin ? 'বাকি এন্ট্রি' : 'বাকি খাতা'}</span>
+                {duesSummary.debtorCount > 0 && (
+                  <span className={`text-[10px] font-mono font-bold ${
+                    activeTab === 'dues' ? 'text-slate-950' : 'text-amber-400'
+                  }`}>
+                    ({duesSummary.debtorCount})
+                  </span>
+                )}
+              </button>
+
+              {isMainAdmin && (
+                <button
+                  onClick={() => setActiveTab('dashboard')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                    activeTab === 'dashboard'
+                      ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 font-black shadow-md shadow-cyan-500/20'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                  }`}
+                >
+                  <BarChart3 className="w-3.5 h-3.5" />
+                  <span>হিসাব ও রিপোর্ট</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => setActiveTab('preorders')}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                  activeTab === 'preorders'
+                    ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white font-black shadow-md shadow-purple-500/25'
+                    : 'text-slate-400 hover:text-purple-300 hover:bg-slate-800/60'
+                }`}
+              >
+                <PackagePlus className="w-3.5 h-3.5" />
+                <span>চাহিদা ও প্রি-অর্ডার</span>
+                {productPreOrders.filter(o => o.status === 'pending').length > 0 && (
+                  <span className={`text-[10px] font-mono font-bold ${
+                    activeTab === 'preorders' ? 'text-white' : 'text-purple-400'
+                  }`}>
+                    ({productPreOrders.filter(o => o.status === 'pending').length})
+                  </span>
+                )}
+              </button>
+            </div>
+
+            {/* Quick Tools Ribbon (Clean Single-Row Action Bar) */}
+            <div className="flex items-center gap-1.5 flex-shrink-0">
+              {isSubAdmin ? (
+                <div className="flex items-center bg-slate-900/70 border border-slate-800/80 p-1 rounded-2xl gap-1">
+                  <button
+                    onClick={() => handleOpenAddItem()}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-cyan-300 hover:bg-slate-800 transition-all whitespace-nowrap"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>+ স্টক এন্ট্রি</span>
+                  </button>
+                  <button
+                    onClick={() => {
+                      setDuePreselectedCustomer(null);
+                      setIsAddDueModalOpen(true);
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-amber-300 hover:bg-slate-800 transition-all whitespace-nowrap"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-amber-400" />
+                    <span>+ বাকি এন্ট্রি</span>
+                  </button>
+                  <button
+                    onClick={handleOpenAddPreOrder}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold text-purple-300 hover:bg-slate-800 transition-all whitespace-nowrap"
+                    title="কাস্টমার বায়না দিয়ে অর্ডার করেছে বা দোকানের মাল লাগবে"
+                  >
+                    <PackagePlus className="w-3.5 h-3.5 text-purple-400" />
+                    <span>+ প্রি-অর্ডার</span>
+                  </button>
+                </div>
+              ) : isMainAdmin ? (
+                <div className="flex items-center bg-slate-900/70 border border-slate-800/80 p-1 rounded-2xl gap-1">
+                  <button
+                    onClick={handleOpenAddPreOrder}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-purple-300 hover:text-purple-200 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="নতুন পণ্য চাহিদা বা কাস্টমার প্রি-অর্ডার এন্ট্রি"
+                  >
+                    <PackagePlus className="w-3.5 h-3.5 text-purple-400" />
+                    <span>+ প্রি-অর্ডার</span>
+                  </button>
+
+                  <button
+                    onClick={() => setIsDailySummaryOpen(true)}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-300 hover:text-emerald-300 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="আজকের লাভ-ক্ষতি ও সারসংক্ষেপ"
+                  >
+                    <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>আজকের লাভ</span>
+                  </button>
+
+                  <button
+                    onClick={() => setIsCashDrawerOpen(true)}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-300 hover:text-teal-300 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="আজকের ক্যাশ ড্রয়ার"
+                  >
+                    <DollarSign className="w-3.5 h-3.5 text-teal-400" />
+                    <span>ক্যাশ ড্রয়ার</span>
+                  </button>
+
+                  <button
+                    onClick={() => setIsExpenseModalOpen(true)}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-300 hover:text-rose-300 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="দোকান খরচ এন্ট্রি"
+                  >
+                    <DollarSign className="w-3.5 h-3.5 text-rose-400" />
+                    <span>দোকান খরচ</span>
+                  </button>
+
+                  <button
+                    onClick={() => setIsSupplierModalOpen(true)}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-300 hover:text-purple-300 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="মহাজন ও সাপ্লায়ার খাতা"
+                  >
+                    <Building2 className="w-3.5 h-3.5 text-purple-400" />
+                    <span>মহাজন ({supplierDues.length})</span>
+                  </button>
+
+                  <button
+                    onClick={() => setIsProfitCalcOpen(true)}
+                    className="hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-300 hover:text-cyan-300 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="লাভ ও ডিসকাউন্ট ক্যালকুলেটর"
+                  >
+                    <Percent className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>লাভ হিসাব</span>
+                  </button>
+
+                  <button
+                    onClick={() => setIsMessageHubOpen(true)}
+                    className="hidden xl:flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold text-slate-300 hover:text-emerald-300 hover:bg-slate-800/80 transition-all whitespace-nowrap"
+                    title="হোয়াটসঅ্যাপ তাগাদা মেসেজ"
+                  >
+                    <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>তাগাদা SMS</span>
+                  </button>
+                </div>
+              ) : null}
+            </div>
           </div>
         </div>
       </header>
@@ -1505,6 +3551,45 @@ export default function App() {
       {/* Main Content Body */}
       <main className="max-w-6xl mx-auto p-4 flex-1 w-full space-y-5">
         
+        {/* ================= TAB 0: EXECUTIVE HOME HUB ================= */}
+        {activeTab === 'home' && (
+          <HomeHubView
+            userRole={userRole}
+            isMainAdmin={isMainAdmin}
+            isSubAdmin={isSubAdmin}
+            isPrivacyMode={isPrivacyMode}
+            activeSeller={activeSeller}
+            todaySummary={todaySummary}
+            duesSummary={duesSummary}
+            stockSummary={stockSummary}
+            mobilePartsCount={mobilePartsCount}
+            onNavigateTab={tab => setActiveTab(tab)}
+            onOpenAddItem={category => handleOpenAddItem(category)}
+            onOpenCashMemoStudio={() => setIsCashMemoStudioOpen(true)}
+            onOpenDailySummary={() => setIsDailySummaryOpen(true)}
+            onOpenExpenseModal={() => { setEditingExpense(null); setIsExpenseModalOpen(true); }}
+            onOpenAddDue={() => { setDuePreselectedCustomer(null); setIsAddDueModalOpen(true); }}
+            onReprintReceipt={handleReprintSaleReceipt}
+            onShareWhatsApp={handleShareSaleWhatsApp}
+          />
+        )}
+
+        {/* ================= DEDICATED TAB: MOBILE SPARE PARTS ONLY (আলাদা অপশন: শুধু মোবাইল পার্টস) ================= */}
+        {activeTab === 'mobile_parts' && (
+          <MobilePartsView
+            inventory={inventory}
+            isMainAdmin={isMainAdmin}
+            isSubAdmin={isSubAdmin}
+            isPrivacyMode={isPrivacyMode}
+            onOpenAddItem={cat => handleOpenAddItem(cat)}
+            onOpenEditItem={handleOpenEditItem}
+            onAddToCart={handleAddToCart}
+            onQuickSell={handleOpenSell}
+            onOpenStockAdjust={item => handleOpenEditItem(item)}
+            onOpenReorder={() => setIsReorderModalOpen(true)}
+          />
+        )}
+
         {/* ================= TAB 1: PARTS STOCK (INVENTORY) ================= */}
         {activeTab === 'inventory' && (
           <div className="space-y-4 animate-in fade-in duration-200">
@@ -1529,22 +3614,24 @@ export default function App() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  {/* Master Privacy Toggle for Buy Prices / Valuation */}
-                  <button
-                    onClick={togglePrivacyMode}
-                    className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-xl border transition-all shadow-sm ${
-                      isPrivacyMode
-                        ? 'bg-amber-950/70 border-amber-500/50 text-amber-300 hover:bg-amber-900/60'
-                        : 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/60'
-                    }`}
-                    title={isPrivacyMode ? 'কাস্টমার মোড: সকল কেনা দাম সুরক্ষিত ও গোপন' : 'এডমিন মোড: কেনা দাম দেখা যাচ্ছে'}
-                  >
-                    {isPrivacyMode ? <EyeOff className="w-3.5 h-3.5 text-amber-400" /> : <Eye className="w-3.5 h-3.5 text-emerald-400" />}
-                    <span>{isPrivacyMode ? '🔒 কেনা দাম গোপন' : '🔓 কেনা দাম উন্মুক্ত'}</span>
-                  </button>
+                  {/* Master Privacy Toggle for Buy Prices / Valuation (Main Admin Only) */}
+                  {isMainAdmin && (
+                    <button
+                      onClick={togglePrivacyMode}
+                      className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-xl border transition-all shadow-sm ${
+                        isPrivacyMode
+                          ? 'bg-amber-950/70 border-amber-500/50 text-amber-300 hover:bg-amber-900/60'
+                          : 'bg-emerald-950/70 border-emerald-500/50 text-emerald-300 hover:bg-emerald-900/60'
+                      }`}
+                      title={isPrivacyMode ? 'কাস্টমার মোড: সকল কেনা দাম সুরক্ষিত ও গোপন' : 'এডমিন মোড: কেনা দাম দেখা যাচ্ছে'}
+                    >
+                      {isPrivacyMode ? <EyeOff className="w-3.5 h-3.5 text-amber-400" /> : <Eye className="w-3.5 h-3.5 text-emerald-400" />}
+                      <span>{isPrivacyMode ? '🔒 কেনা দাম গোপন' : '🔓 কেনা দাম উন্মুক্ত'}</span>
+                    </button>
+                  )}
 
-                  {/* Wholesale Reorder List Button */}
-                  {stockSummary.lowStockCount > 0 && (
+                  {/* Wholesale Reorder List Button (Main Admin Only) */}
+                  {isMainAdmin && stockSummary.lowStockCount > 0 && (
                     <button
                       onClick={() => setIsReorderModalOpen(true)}
                       className="flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-xl bg-purple-950/60 border border-purple-500/40 text-purple-300 hover:bg-purple-900/60 transition-all shadow-sm"
@@ -1555,20 +3642,20 @@ export default function App() {
                     </button>
                   )}
 
-                  {userRole === 'main_admin' && (
+                  {isAdminLoggedIn && (
                     <button
-                      onClick={handleOpenAddItem}
-                      className="flex items-center gap-1.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold px-3.5 py-1.5 rounded-xl text-xs transition-all shadow-md active:scale-95"
+                      onClick={() => handleOpenAddItem()}
+                      className="flex items-center gap-1.5 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-black px-3.5 py-1.5 rounded-xl text-xs transition-all shadow-md active:scale-95 shadow-cyan-500/20"
                     >
-                      <Plus className="w-4 h-4" />
-                      <span>নতুন মালামাল যোগ</span>
+                      <Plus className="w-4 h-4 stroke-[3]" />
+                      <span>+ নতুন মালামাল যোগ (স্টক এন্ট্রি)</span>
                     </button>
                   )}
                 </div>
               </div>
 
-              {/* Summary 4-Column Cards */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
+              {/* Summary Cards */}
+              <div className={`grid grid-cols-2 ${isMainAdmin ? 'md:grid-cols-4' : 'md:grid-cols-2'} gap-3 mt-4`}>
                 {/* 1. Total Stock Units */}
                 <div className="bg-slate-950/70 border border-slate-800 p-3.5 rounded-2xl">
                   <span className="block text-[10px] uppercase font-bold tracking-wider text-slate-400 flex items-center gap-1">
@@ -1583,19 +3670,21 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* 2. Total Buy Value (Asset Investment) */}
-                <div className="bg-slate-950/70 border border-cyan-900/40 p-3.5 rounded-2xl relative">
-                  <span className="block text-[10px] uppercase font-bold tracking-wider text-cyan-400 flex items-center gap-1">
-                    <DollarSign className="w-3.5 h-3.5" />
-                    মোট ক্রয়মূল্য (Asset Value)
-                  </span>
-                  <div className="mt-1">
-                    <span className="text-xl sm:text-2xl font-black font-mono text-cyan-400">
-                      {isPrivacyMode ? '••••••••' : `৳ ${stockSummary.totalBuyVal.toLocaleString()}`}
+                {/* 2. Total Buy Value (Asset Investment) - Main Admin Only */}
+                {isMainAdmin && (
+                  <div className="bg-slate-950/70 border border-cyan-900/40 p-3.5 rounded-2xl relative">
+                    <span className="block text-[10px] uppercase font-bold tracking-wider text-cyan-400 flex items-center gap-1">
+                      <DollarSign className="w-3.5 h-3.5" />
+                      মোট ক্রয়মূল্য (Asset Value)
                     </span>
+                    <div className="mt-1">
+                      <span className="text-xl sm:text-2xl font-black font-mono text-cyan-400">
+                        {isPrivacyMode ? '••••••••' : `৳ ${stockSummary.totalBuyVal.toLocaleString()}`}
+                      </span>
+                    </div>
+                    <span className="block text-[9px] text-slate-500 mt-0.5">কেনা দামের মোট ইনভেস্টমেন্ট</span>
                   </div>
-                  <span className="block text-[9px] text-slate-500 mt-0.5">কেনা দামের মোট ইনভেস্টমেন্ট</span>
-                </div>
+                )}
 
                 {/* 3. Expected Retail Value */}
                 <div className="bg-slate-950/70 border border-emerald-900/40 p-3.5 rounded-2xl">
@@ -1611,19 +3700,21 @@ export default function App() {
                   <span className="block text-[9px] text-slate-500 mt-0.5">সব বিক্রি হলে মোট বিল আসবে</span>
                 </div>
 
-                {/* 4. Potential Profit */}
-                <div className="bg-slate-950/70 border border-blue-900/40 p-3.5 rounded-2xl">
-                  <span className="block text-[10px] uppercase font-bold tracking-wider text-blue-400 flex items-center gap-1">
-                    <TrendingUp className="w-3.5 h-3.5" />
-                    সম্ভাব্য মোট লাভ
-                  </span>
-                  <div className="mt-1">
-                    <span className="text-xl sm:text-2xl font-black font-mono text-blue-400">
-                      {isPrivacyMode ? '••••••••' : `৳ ${stockSummary.potentialProfit.toLocaleString()}`}
+                {/* 4. Potential Profit - Main Admin Only */}
+                {isMainAdmin && (
+                  <div className="bg-slate-950/70 border border-blue-900/40 p-3.5 rounded-2xl">
+                    <span className="block text-[10px] uppercase font-bold tracking-wider text-blue-400 flex items-center gap-1">
+                      <TrendingUp className="w-3.5 h-3.5" />
+                      সম্ভাব্য মোট লাভ
                     </span>
+                    <div className="mt-1">
+                      <span className="text-xl sm:text-2xl font-black font-mono text-blue-400">
+                        {isPrivacyMode ? '••••••••' : `৳ ${stockSummary.potentialProfit.toLocaleString()}`}
+                      </span>
+                    </div>
+                    <span className="block text-[9px] text-slate-500 mt-0.5">বিক্রয়ের পর প্রত্যাশিত লাভ</span>
                   </div>
-                  <span className="block text-[9px] text-slate-500 mt-0.5">বিক্রয়ের পর প্রত্যাশিত লাভ</span>
-                </div>
+                )}
               </div>
 
               {/* Low Stock Filter Warning Bar */}
@@ -1647,28 +3738,228 @@ export default function App() {
               )}
             </div>
 
-            {/* 2. SEARCH BAR & FILTERS (SOLVES BUG 3: Match highlight for models and search query) */}
+            {/* 2. SEARCH BAR & FILTERS (WITH RECENT SEARCHES DROPDOWN) */}
             <div className="space-y-3">
-              <div className="relative group">
-                <div className="absolute inset-y-0 left-0 flex items-center pl-4 pointer-events-none">
-                  <Search className="w-5 h-5 text-slate-500 group-focus-within:text-cyan-400 transition-colors" />
+              <div ref={searchContainerRef} className="relative">
+                <div className="relative group">
+                  <div className="absolute inset-y-0 left-0 flex items-center pl-4 pointer-events-none">
+                    <Search className="w-5 h-5 text-slate-500 group-focus-within:text-cyan-400 transition-colors" />
+                  </div>
+                  <input
+                    type="text"
+                    value={searchQuery}
+                    onFocus={() => setIsSearchDropdownOpen(true)}
+                    onClick={() => setIsSearchDropdownOpen(true)}
+                    onChange={e => {
+                      setSearchQuery(e.target.value);
+                      setIsSearchDropdownOpen(true);
+                    }}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        if (searchQuery.trim()) {
+                          handleAddRecentSearch(searchQuery);
+                          setIsSearchDropdownOpen(false);
+                        }
+                      } else if (e.key === 'Escape') {
+                        setIsSearchDropdownOpen(false);
+                      }
+                    }}
+                    placeholder="মডেল বা পার্টস খুঁজুন (যেমন: Y17, Y20, A50, Universal, ইত্যাদি)..."
+                    className="w-full bg-slate-900 border-2 border-slate-800 rounded-2xl pl-12 pr-32 sm:pr-48 py-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-500 transition-all shadow-lg"
+                  />
+                  <div className="absolute inset-y-0 right-0 pr-3 flex items-center gap-1.5">
+                    {searchQuery && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSearchQuery('');
+                          setIsSearchDropdownOpen(true);
+                        }}
+                        className="text-xs text-slate-400 hover:text-white px-1.5 py-1 rounded-md hover:bg-slate-800 transition-colors"
+                        title="সার্চ মুছুন"
+                      >
+                        ✕
+                      </button>
+                    )}
+                    {searchQuery.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          handleAddRecentSearch(searchQuery);
+                          setIsSearchDropdownOpen(false);
+                        }}
+                        className="hidden sm:flex items-center gap-1 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold px-2.5 py-1.5 rounded-xl text-xs transition-all shadow-sm active:scale-95"
+                        title="সার্চ সেভ করুন"
+                      >
+                        <Search className="w-3.5 h-3.5 stroke-[2.5]" />
+                        <span>খুঁজুন</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setIsBarcodeModalOpen(true)}
+                      className="flex items-center gap-1 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 px-2.5 py-1.5 rounded-xl text-xs font-bold active:scale-95 transition-all shadow-sm"
+                      title="📷 ক্যামেরা দিয়ে বারকোড স্ক্যান করুন"
+                    >
+                      <ScanBarcode className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>স্ক্যান</span>
+                    </button>
+                  </div>
                 </div>
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                  placeholder="মডেল বা পার্টস খুঁজুন (যেমন: Y17, Y20, A50, Universal, ইত্যাদি)..."
-                  className="w-full bg-slate-900 border-2 border-slate-800 rounded-2xl pl-12 pr-10 py-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-cyan-500 transition-all shadow-lg"
-                />
-                {searchQuery && (
-                  <button
-                    onClick={() => setSearchQuery('')}
-                    className="absolute inset-y-0 right-0 pr-4 flex items-center text-xs text-slate-400 hover:text-white"
-                  >
-                    ✕ মুছে ফেলুন
-                  </button>
+
+                {/* Recent Searches & Suggestions Dropdown */}
+                {isSearchDropdownOpen && (
+                  <div className="absolute top-full left-0 right-0 mt-2 z-50 bg-slate-900/95 backdrop-blur-2xl border border-slate-700/80 rounded-2xl shadow-2xl shadow-black/80 overflow-hidden divide-y divide-slate-800/80 animate-in fade-in slide-in-from-top-1 duration-150">
+                    {/* Header */}
+                    <div className="p-3 bg-slate-950/70 flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2">
+                        <div className="w-6 h-6 rounded-lg bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 flex items-center justify-center">
+                          <History className="w-3.5 h-3.5" />
+                        </div>
+                        <span className="font-bold text-slate-200">
+                          সাম্প্রতিক অনুসন্ধান (Recent Searches)
+                        </span>
+                        {recentSearches.length > 0 && (
+                          <span className="text-[10px] font-mono font-bold bg-slate-800 text-cyan-400 px-1.5 py-0.5 rounded-md">
+                            {recentSearches.length}
+                          </span>
+                        )}
+                      </div>
+                      {recentSearches.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleClearAllRecentSearches}
+                          className="text-[11px] text-slate-400 hover:text-rose-400 flex items-center gap-1 transition-colors px-2 py-0.5 rounded-md hover:bg-rose-500/10 font-semibold"
+                          title="সমস্ত সাম্প্রতিক সার্চ মুছে ফেলুন"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>সব মুছুন</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {/* Recent Searches List */}
+                    <div className="max-h-56 overflow-y-auto divide-y divide-slate-800/50">
+                      {(() => {
+                        const qTrim = searchQuery.toLowerCase().trim();
+                        const displayedRecent = qTrim
+                          ? recentSearches.filter(s => s.toLowerCase().includes(qTrim))
+                          : recentSearches;
+
+                        if (displayedRecent.length === 0) {
+                          return (
+                            <div className="p-4 text-center text-xs text-slate-400">
+                              <History className="w-5 h-5 mx-auto text-slate-600 mb-1" />
+                              <span>{qTrim ? `'${searchQuery}' এর সাথে কোনো সাম্প্রতিক অনুসন্ধান মিল পাওয়া যায়নি` : 'কোনো সাম্প্রতিক অনুসন্ধান নেই'}</span>
+                            </div>
+                          );
+                        }
+
+                        return displayedRecent.map((term, idx) => {
+                          const matchCount = inventory.filter(item => {
+                            const t = term.toLowerCase().trim();
+                            return (
+                              isMatch(item.name, t) ||
+                              (Array.isArray(item.models) && item.models.some(m => isMatch(m, t))) ||
+                              isMatch(item.brand, t) ||
+                              (item.sku && isMatch(item.sku, t))
+                            );
+                          }).length;
+
+                          return (
+                            <div
+                              key={`recent_term_${term}_${idx}`}
+                              onClick={() => handleSelectRecentSearch(term)}
+                              className="flex items-center justify-between px-3.5 py-2.5 hover:bg-slate-800/80 cursor-pointer group transition-colors"
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <Clock className="w-3.5 h-3.5 text-slate-500 group-hover:text-cyan-400 flex-shrink-0 transition-colors" />
+                                <span className="text-sm font-semibold text-slate-200 group-hover:text-cyan-300 truncate">
+                                  {term}
+                                </span>
+                                {matchCount > 0 && (
+                                  <span className="text-[10px] font-mono text-slate-400 bg-slate-950/80 border border-slate-800 px-1.5 py-0.2 rounded-md flex-shrink-0">
+                                    {matchCount} টি পণ্য
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-1.5 flex-shrink-0">
+                                <span className="text-[10px] text-cyan-400 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5 font-bold">
+                                  খুঁজুন <ArrowRight className="w-2.5 h-2.5" />
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={e => handleRemoveRecentSearch(term, e)}
+                                  className="p-1 rounded-md text-slate-500 hover:text-rose-400 hover:bg-slate-700/60 transition-colors ml-1"
+                                  title="ইতিহাস থেকে মুছুন"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        });
+                      })()}
+                    </div>
+
+                    {/* Quick Popular Models Section */}
+                    {popularInventoryModels.length > 0 && (
+                      <div className="p-3 bg-slate-950/40">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-[11px] font-bold text-slate-400 flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-amber-400" />
+                            <span>জনপ্রিয় মডেল ও পার্টস সাজেশন্স:</span>
+                          </span>
+                          <span className="text-[10px] text-slate-500">১-ক্লিক সার্চ</span>
+                        </div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {popularInventoryModels.map((m, mIdx) => (
+                            <button
+                              key={`pop_model_${m}_${mIdx}`}
+                              type="button"
+                              onClick={() => handleSelectRecentSearch(m)}
+                              className="text-xs bg-slate-800/90 hover:bg-cyan-500 hover:text-slate-950 text-slate-300 font-semibold px-2.5 py-1 rounded-lg border border-slate-700/60 transition-all active:scale-95 shadow-sm"
+                            >
+                              {m}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Bottom Instructions Footer */}
+                    <div className="px-3.5 py-2 bg-slate-950/90 flex items-center justify-between text-[11px] text-slate-500">
+                      <div className="flex items-center gap-2">
+                        <span><kbd className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px]">Enter</kbd> সেভ ও সার্চ</span>
+                        <span><kbd className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[10px]">Esc</kbd> বন্ধ</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setIsSearchDropdownOpen(false)}
+                        className="text-slate-400 hover:text-slate-200 transition-colors font-medium text-xs"
+                      >
+                        মেনু বন্ধ
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
+
+              {/* Professional Category Showcase with Mobile Parts & Accessories Scope (আলাদা অপশন: শুধু মোবাইল পার্টস) */}
+              <ProfessionalCategoryBar
+                selectedCategory={selectedCategory}
+                onSelectCategory={cat => setSelectedCategory(cat)}
+                categoryCounts={categoryCounts}
+                categoryScope={categoryScope}
+                onSelectCategoryScope={scope => {
+                  setCategoryScope(scope);
+                  setSelectedCategory('');
+                }}
+                partsTotalCount={mobilePartsCount}
+                accessoriesTotalCount={accessoriesCount}
+                allTotalCount={inventory.length}
+                availableCategories={availableCategories}
+              />
 
               {/* Quick Brand Pills Filter */}
               <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs">
@@ -1676,7 +3967,7 @@ export default function App() {
                   onClick={() => { setSelectedBrand(''); setSelectedCategory(''); }}
                   className={`px-3 py-1 rounded-xl font-bold whitespace-nowrap transition-colors ${
                     !selectedBrand && !selectedCategory
-                      ? 'bg-cyan-500 text-slate-950'
+                      ? 'bg-cyan-500 text-slate-950 font-black'
                       : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
                   }`}
                 >
@@ -1688,7 +3979,7 @@ export default function App() {
                     onClick={() => setSelectedBrand(selectedBrand === b ? '' : b)}
                     className={`px-3 py-1 rounded-xl font-bold whitespace-nowrap transition-colors ${
                       selectedBrand === b
-                        ? 'bg-cyan-500 text-slate-950'
+                        ? 'bg-cyan-500 text-slate-950 font-black'
                         : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
                     }`}
                   >
@@ -1713,7 +4004,7 @@ export default function App() {
                       onClick={() => setStockStatusFilter(f.id as any)}
                       className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-all ${
                         stockStatusFilter === f.id
-                          ? 'bg-cyan-500 text-slate-950 shadow-sm'
+                          ? 'bg-cyan-500 text-slate-950 shadow-sm font-black'
                           : 'bg-slate-900/80 text-slate-400 hover:text-slate-200 border border-slate-800'
                       }`}
                     >
@@ -1723,16 +4014,27 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center gap-2">
-                  {/* Category Dropdown */}
+                  {/* Category Dropdown with Organized Optgroups */}
                   <select
                     value={selectedCategory}
                     onChange={e => setSelectedCategory(e.target.value)}
                     className="bg-slate-900 border border-slate-800 text-[11px] text-slate-300 rounded-xl px-2.5 py-1 focus:outline-none focus:border-cyan-500 font-semibold cursor-pointer"
                   >
                     <option value="">সব ক্যাটাগরি</option>
-                    {availableCategories.map((c, idx) => (
-                      <option key={`cat_opt_${c}_${idx}`} value={c} className="bg-slate-900 text-slate-200">{c}</option>
-                    ))}
+                    <optgroup label="🔧 মোবাইল পার্টস">
+                      {availableCategories.filter(c => isMobilePartItem(c)).map((c, idx) => (
+                        <option key={`cat_opt_part_${c}_${idx}`} value={c} className="bg-slate-900 text-slate-200">
+                          {getCategoryDisplay(c).nameBn} ({c})
+                        </option>
+                      ))}
+                    </optgroup>
+                    <optgroup label="🎧 এক্সেসরিজ ও অন্যান্য">
+                      {availableCategories.filter(c => !isMobilePartItem(c)).map((c, idx) => (
+                        <option key={`cat_opt_acc_${c}_${idx}`} value={c} className="bg-slate-900 text-slate-200">
+                          {getCategoryDisplay(c).nameBn} ({c})
+                        </option>
+                      ))}
+                    </optgroup>
                   </select>
 
                   {/* Sort By Dropdown */}
@@ -1837,8 +4139,8 @@ export default function App() {
                                   বিক্রি: ৳{item.sellingPrice}
                                 </span>
 
-                                {/* Buy Price with Privacy Protection & Secret Cipher Code */}
-                                {(() => {
+                                {/* Buy Price with Privacy Protection & Secret Cipher Code (Main Admin Only) */}
+                                {isMainAdmin && (() => {
                                   const cardVisible = isCardPriceVisible(uniqueItemKey);
                                   return (
                                     <span className={`text-[10px] font-mono px-2 py-0.5 rounded flex items-center gap-1 border transition-all ${
@@ -1904,19 +4206,19 @@ export default function App() {
                                 </span>
                               </div>
 
-                              {/* Quick +1, +5 for Admin */}
-                              {userRole === 'main_admin' && (
+                              {/* Quick +1, +5 for Stock Entry (Main Admin & Sub Admin) */}
+                              {isAdminLoggedIn && (
                                 <div className="flex gap-1 mt-1 justify-center">
                                   <button
                                     onClick={() => handleQuickStockAdjust(item, 1)}
-                                    title="+১ পিস যোগ"
+                                    title="+১ পিস স্টক যোগ"
                                     className="text-[9px] bg-slate-800 hover:bg-slate-700 text-cyan-400 px-1 py-0.5 rounded font-mono font-bold"
                                   >
                                     +1
                                   </button>
                                   <button
                                     onClick={() => handleQuickStockAdjust(item, 5)}
-                                    title="+৫ পিস যোগ"
+                                    title="+৫ পিস স্টক যোগ"
                                     className="text-[9px] bg-slate-800 hover:bg-slate-700 text-cyan-400 px-1 py-0.5 rounded font-mono font-bold"
                                   >
                                     +5
@@ -1947,16 +4249,19 @@ export default function App() {
                                 {models.map((m, mIdx) => {
                                   const thisMatches = searchQuery.trim() && isMatch(m, searchQuery);
                                   return (
-                                    <span
+                                    <button
                                       key={`model_${uniqueItemKey}_${m}_${mIdx}`}
-                                      className={`px-2 py-0.5 rounded text-[11px] font-mono font-bold transition-all ${
+                                      type="button"
+                                      onClick={() => handleSelectRecentSearch(m)}
+                                      title={`'${m}' মডেল দিয়ে সার্চ করুন`}
+                                      className={`px-2 py-0.5 rounded text-[11px] font-mono font-bold transition-all cursor-pointer hover:border-cyan-400 active:scale-95 ${
                                         thisMatches
                                           ? 'bg-amber-400 text-slate-950 border-2 border-amber-300 ring-2 ring-amber-400/40 shadow-lg scale-105'
-                                          : 'bg-slate-900 border border-slate-800 text-slate-300'
+                                          : 'bg-slate-900 border border-slate-800 text-slate-300 hover:text-cyan-300'
                                       }`}
                                     >
                                       <HighlightText text={m} query={searchQuery} />
-                                    </span>
+                                    </button>
                                   );
                                 })}
                               </div>
@@ -1967,38 +4272,55 @@ export default function App() {
                         {/* Bottom Actions */}
                         <div className="mt-4 pt-3 border-t border-slate-800/60 flex items-center justify-between gap-2">
                           <div className="flex gap-1.5">
-                            {userRole === 'main_admin' && (
-                              <>
-                                <button
-                                  onClick={() => handleOpenEditItem(item)}
-                                  className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-cyan-400 rounded-xl transition-colors"
-                                  title="এডিট করুন"
-                                >
-                                  <Edit className="w-3.5 h-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => handleDeleteItem(item.id, item.name)}
-                                  className="p-2 bg-slate-800/80 hover:bg-red-950/50 text-slate-400 hover:text-red-400 rounded-xl transition-colors"
-                                  title="মুছে ফেলুন"
-                                >
-                                  <Trash2 className="w-3.5 h-3.5" />
-                                </button>
-                              </>
+                            {isAdminLoggedIn && (
+                              <button
+                                onClick={() => handleOpenEditItem(item)}
+                                className="p-2 bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-cyan-400 rounded-xl transition-colors flex items-center gap-1 text-[11px] font-bold"
+                                title={isMainAdmin ? 'এডিট করুন' : 'স্টক এন্ট্রি ও আপডেট করুন'}
+                              >
+                                <Edit className="w-3.5 h-3.5" />
+                                {isSubAdmin && <span>স্টক যোগ</span>}
+                              </button>
+                            )}
+                            {isMainAdmin && (
+                              <button
+                                onClick={() => handleDeleteItem(item.id, item.name)}
+                                className="p-2 bg-slate-800/80 hover:bg-red-950/50 text-slate-400 hover:text-red-400 rounded-xl transition-colors"
+                                title="মুছে ফেলুন (শুধুমাত্র Main Admin)"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
                             )}
                           </div>
 
-                          <button
-                            onClick={() => handleOpenSell(item)}
-                            disabled={isOutStock}
-                            className={`px-5 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center gap-1.5 shadow-lg active:scale-95 ${
-                              isOutStock
-                                ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                                : 'bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 shadow-emerald-500/20'
-                            }`}
-                          >
-                            <ShoppingBag className="w-3.5 h-3.5" />
-                            <span>বিক্রি করুন</span>
-                          </button>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              onClick={() => handleAddToCart(item)}
+                              disabled={isOutStock}
+                              className={`p-2 rounded-xl text-xs font-bold transition-all flex items-center gap-1 border active:scale-95 ${
+                                isOutStock
+                                  ? 'bg-slate-800/40 border-slate-800 text-slate-600 cursor-not-allowed'
+                                  : 'bg-slate-900 border-slate-700/80 hover:border-cyan-500/50 text-cyan-400 hover:text-cyan-300'
+                              }`}
+                              title="কার্টে যোগ করুন"
+                            >
+                              <ShoppingCart className="w-3.5 h-3.5" />
+                              <span className="hidden sm:inline">কার্ট</span>
+                            </button>
+
+                            <button
+                              onClick={() => handleOpenSell(item)}
+                              disabled={isOutStock}
+                              className={`px-4 sm:px-5 py-2 rounded-xl text-xs font-black uppercase tracking-wider transition-all flex items-center gap-1.5 shadow-lg active:scale-95 ${
+                                isOutStock
+                                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                                  : 'bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 shadow-emerald-500/20'
+                              }`}
+                            >
+                              <ShoppingBag className="w-3.5 h-3.5" />
+                              <span>বিক্রি করুন</span>
+                            </button>
+                          </div>
                         </div>
                       </div>
                     );
@@ -2064,7 +4386,7 @@ export default function App() {
               {/* Action Button based on sub-tab */}
               {serviceSubTab === 'repairs' && (
                 <button
-                  onClick={() => setIsRepairModalOpen(true)}
+                  onClick={handleOpenAddRepairJob}
                   className="bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-bold px-3.5 py-1.5 rounded-xl text-xs flex items-center gap-1.5 shadow-md transition-transform active:scale-95 whitespace-nowrap"
                 >
                   <Plus className="w-4 h-4" />
@@ -2074,7 +4396,7 @@ export default function App() {
 
               {serviceSubTab === 'digital' && (
                 <button
-                  onClick={() => setIsServiceModalOpen(true)}
+                  onClick={handleOpenAddService}
                   className="bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-slate-50 font-bold px-3.5 py-1.5 rounded-xl text-xs flex items-center gap-1.5 shadow-md transition-transform active:scale-95 whitespace-nowrap"
                 >
                   <Plus className="w-4 h-4" />
@@ -2084,7 +4406,10 @@ export default function App() {
 
               {serviceSubTab === 'expenses' && (
                 <button
-                  onClick={() => setIsExpenseModalOpen(true)}
+                  onClick={() => {
+                    setEditingExpense(null);
+                    setIsExpenseModalOpen(true);
+                  }}
                   className="bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-bold px-3.5 py-1.5 rounded-xl text-xs flex items-center gap-1.5 shadow-md transition-transform active:scale-95 whitespace-nowrap"
                 >
                   <Plus className="w-4 h-4" />
@@ -2101,7 +4426,7 @@ export default function App() {
                     <Smartphone className="w-10 h-10 mx-auto text-slate-600 mb-2" />
                     <p>বর্তমানে কোনো মোবাইল রিপেয়ারিংয়ের জব কার্ড এন্ট্রি নেই।</p>
                     <button
-                      onClick={() => setIsRepairModalOpen(true)}
+                      onClick={handleOpenAddRepairJob}
                       className="mt-2 text-xs text-cyan-400 underline font-bold"
                     >
                       কাস্টমারের ফোন জমা নিন (+ জব কার্ড)
@@ -2173,7 +4498,7 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Status Changing Bar */}
+                          {/* Status Changing Bar & Edit/Delete */}
                           <div className="mt-3 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
                             <div className="flex gap-1.5 text-xs">
                               {job.status === 'pending' && (
@@ -2195,25 +4520,42 @@ export default function App() {
                                   <span>ডেলিভারি দিন</span>
                                 </button>
                               )}
+
+                              <button
+                                onClick={() => handleOpenEditRepairJob(job)}
+                                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-cyan-950/80 text-slate-200 hover:text-cyan-300 border border-slate-700 hover:border-cyan-500/40 font-bold text-[11px] flex items-center gap-1 transition-all"
+                                title="ভুল এন্ট্রি এডিট ও সংশোধন করুন"
+                              >
+                                <Edit className="w-3.5 h-3.5 text-cyan-400" />
+                                <span>এডিট</span>
+                              </button>
                             </div>
 
                             <div className="flex items-center gap-1">
                               {job.customerPhone && (
                                 <button
                                   onClick={() => {
-                                    const cleanPhone = job.customerPhone.replace(/[^0-9]/g, '');
-                                    const intlPhone = cleanPhone.startsWith('0') ? '88' + cleanPhone : cleanPhone;
                                     let msg = `আসসালামু আলাইকুম ${job.customerName} ভাই,\n`;
                                     msg += `অনিক টেলিকমে আপনার ${job.deviceModel} ফোনের কাজের বর্তমান আপডেট:\n`;
                                     msg += `স্ট্যাটাস: ${isReady ? 'কাজ সম্পন্ন হয়েছে, এসে নিয়ে যান' : 'কাজ চলছে'}।\n`;
                                     msg += `মোট খরচ: ৳${job.estimatedCost} | অগ্রিম: ৳${job.advancePaid} | বকেয়া: ৳${remainingDue}।\n`;
                                     msg += `ধন্যবাদ - অনিক টেলিকম।`;
-                                    window.open(`https://wa.me/${intlPhone}?text=${encodeURIComponent(msg)}`, '_blank');
+                                    sendWhatsAppMessage(job.customerPhone, msg);
                                   }}
                                   className="p-1 text-emerald-400 hover:bg-emerald-950/60 rounded border border-emerald-900/40"
                                   title="WhatsApp বার্তা"
                                 >
                                   <Share2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              {job.customerPhone && (
+                                <button
+                                  onClick={() => handleOpenCustomerQr(job.customerName, job.customerPhone, remainingDue)}
+                                  className="p-1 text-amber-400 hover:bg-amber-950/60 rounded border border-amber-900/40"
+                                  title="গ্রাহকের WhatsApp ও কন্টাক্ট QR কোড"
+                                >
+                                  <QrCode className="w-3.5 h-3.5" />
                                 </button>
                               )}
 
@@ -2243,6 +4585,14 @@ export default function App() {
                               >
                                 <Printer className="w-3.5 h-3.5" />
                               </button>
+
+                              <button
+                                onClick={() => handleDeleteRepairJob(job)}
+                                className="p-1 text-slate-400 hover:text-red-400 hover:bg-red-950/40 rounded border border-slate-800 hover:border-red-900/40 transition-colors"
+                                title="জব কার্ড মুছুন"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
                             </div>
                           </div>
                         </div>
@@ -2270,29 +4620,81 @@ export default function App() {
                         className="bg-slate-900 border border-slate-800 rounded-2xl p-4 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 shadow-sm hover:border-slate-700 transition-colors"
                       >
                         <div className="space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="text-[10px] font-mono text-slate-500 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-[10px] font-mono text-slate-400 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
                               {s.date}
                             </span>
                             <span className="text-[10px] text-cyan-400 font-bold bg-cyan-950/60 border border-cyan-800/40 px-2 py-0.5 rounded">
                               অপারেটর: {s.seller || 'Admin'}
                             </span>
+                            <span className="text-[10px] bg-blue-950/50 text-blue-400 px-2 py-0.5 rounded border border-blue-900/50 font-semibold uppercase tracking-wider">
+                              {s.type}
+                            </span>
                           </div>
                           <h4 className="text-sm font-bold text-slate-100">{s.desc}</h4>
-                          <span className="text-[10px] bg-blue-950/50 text-blue-400 px-2 py-0.5 rounded border border-blue-900/50 font-semibold uppercase tracking-wider inline-block">
-                            {s.type}
-                          </span>
+                          {(s.customerName || s.customerPhone) && (
+                            <p className="text-[11px] text-slate-400 font-mono">
+                              গ্রাহক: {s.customerName || 'কাস্টমার'} {s.customerPhone ? `(${s.customerPhone})` : ''}
+                            </p>
+                          )}
                         </div>
 
-                        <div className="text-right flex sm:flex-col justify-between sm:justify-end w-full sm:w-auto items-center sm:items-end border-t sm:border-t-0 border-slate-800/60 pt-2 sm:pt-0">
-                          <span className="text-base font-black font-mono text-emerald-400">
-                            + ৳{s.paid}
-                          </span>
-                          {userRole === 'main_admin' && (
-                            <div className="text-[11px] text-slate-400">
-                              খরচ: ৳{s.cost} | লাভ: <span className="font-bold text-blue-400">৳{profit}</span>
-                            </div>
-                          )}
+                        <div className="flex sm:flex-col justify-between sm:justify-end w-full sm:w-auto items-center sm:items-end border-t sm:border-t-0 border-slate-800/60 pt-2.5 sm:pt-0 gap-2">
+                          <div className="text-left sm:text-right">
+                            <span className="text-base font-black font-mono text-emerald-400 block">
+                              + ৳{s.paid}
+                            </span>
+                            {userRole === 'main_admin' && (
+                              <div className="text-[11px] text-slate-400">
+                                খরচ: ৳{s.cost} | লাভ: <span className="font-bold text-blue-400">৳{profit}</span>
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              onClick={() => handleOpenEditService(s)}
+                              className="px-2.5 py-1.5 rounded-xl bg-slate-800 hover:bg-cyan-950/80 text-slate-200 hover:text-cyan-300 border border-slate-700 hover:border-cyan-500/40 text-[11px] font-bold flex items-center gap-1 transition-all active:scale-95"
+                              title="ভুল সার্ভিস বা লোড এন্ট্রি এডিট করুন"
+                            >
+                              <Edit className="w-3.5 h-3.5 text-cyan-400" />
+                              <span>এডিট</span>
+                            </button>
+
+                            <button
+                              onClick={() => {
+                                setReceiptData({
+                                  title: 'সার্ভিসিং ও লোড রসিদ',
+                                  type: 'service',
+                                  date: s.date,
+                                  customerName: s.customerName || undefined,
+                                  customerPhone: s.customerPhone || undefined,
+                                  items: [
+                                    {
+                                      name: `${s.type} - ${s.desc}`,
+                                      amount: s.paid || 0
+                                    }
+                                  ],
+                                  subtotal: s.paid || 0,
+                                  paid: s.paid || 0,
+                                  due: 0,
+                                  seller: s.seller || activeSeller
+                                });
+                              }}
+                              className="p-1.5 rounded-xl bg-slate-800/80 hover:bg-slate-700 text-cyan-400 border border-slate-700/80 transition-colors"
+                              title="রসিদ প্রিন্ট করুন"
+                            >
+                              <Printer className="w-3.5 h-3.5" />
+                            </button>
+
+                            <button
+                              onClick={() => handleDeleteService(s)}
+                              className="p-1.5 rounded-xl bg-slate-800/80 hover:bg-red-950/60 text-slate-400 hover:text-red-400 border border-slate-700/80 hover:border-red-800/60 transition-colors"
+                              title="সার্ভিস রেকর্ড মুছুন"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     );
@@ -2312,7 +4714,10 @@ export default function App() {
                     </h4>
                   </div>
                   <button
-                    onClick={() => setIsExpenseModalOpen(true)}
+                    onClick={() => {
+                      setEditingExpense(null);
+                      setIsExpenseModalOpen(true);
+                    }}
                     className="bg-red-600 hover:bg-red-500 text-white font-bold px-3 py-1.5 rounded-xl text-xs transition-colors"
                   >
                     + নতুন খরচ যোগ
@@ -2328,18 +4733,40 @@ export default function App() {
                     shopExpenses.map((exp, expIdx) => (
                       <div
                         key={exp._fbKey ? `exp_${exp._fbKey}` : `exp_${exp.id}_${expIdx}`}
-                        className="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex justify-between items-center text-xs"
+                        className="bg-slate-900/80 border border-slate-800 rounded-xl p-3 flex justify-between items-center text-xs hover:border-slate-700 transition-colors"
                       >
                         <div>
                           <div className="flex items-center gap-2">
                             <span className="font-bold text-slate-200">{exp.category}</span>
                             <span className="text-[10px] text-slate-500 font-mono">{exp.date}</span>
+                            {exp.seller && (
+                              <span className="text-[9px] bg-slate-950 px-1.5 py-0.5 rounded text-slate-400 border border-slate-800">
+                                {exp.seller}
+                              </span>
+                            )}
                           </div>
                           <p className="text-[11px] text-slate-400 mt-0.5">{exp.note}</p>
                         </div>
-                        <span className="text-base font-black font-mono text-red-400">
-                          - ৳{exp.amount}
-                        </span>
+                        <div className="flex items-center gap-2">
+                          <span className="text-base font-black font-mono text-red-400 mr-1">
+                            - ৳{exp.amount}
+                          </span>
+                          <button
+                            onClick={() => handleOpenEditExpense(exp)}
+                            className="px-2.5 py-1.5 text-slate-200 hover:text-cyan-300 bg-slate-800 hover:bg-cyan-950/70 border border-slate-700 hover:border-cyan-500/40 rounded-lg transition-colors flex items-center gap-1 text-[11px] font-bold"
+                            title="খরচের এন্ট্রি এডিট করুন"
+                          >
+                            <Edit className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>এডিট</span>
+                          </button>
+                          <button
+                            onClick={() => handleDeleteExpense(exp.id, `${exp.category} (৳${exp.amount})`)}
+                            className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-slate-800/80 rounded-lg transition-colors"
+                            title="খরচের রেকর্ড মুছুন"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </div>
                     ))
                   )}
@@ -2500,9 +4927,9 @@ export default function App() {
                             </div>
                           </div>
 
-                          {/* Quick Action Buttons (SOLVES BUG 2) */}
+                          {/* Quick Action Buttons (Sub Admin only gets + বাকি যোগ; Main Admin gets all) */}
                           <div className="flex flex-wrap items-center gap-1.5 w-full sm:w-auto">
-                            {/* 1. Add More Due Directly To This Customer */}
+                            {/* 1. Add More Due Directly To This Customer (Baki Entry - Allowed for Both Main & Sub Admin) */}
                             <button
                               onClick={() => {
                                 setDuePreselectedCustomer(cust);
@@ -2515,45 +4942,61 @@ export default function App() {
                               <span>+ বাকি যোগ</span>
                             </button>
 
-                            {/* 2. Collect Payment */}
-                            {!isPaidFull && (
-                              <button
-                                onClick={() => setCollectingCustomer(cust)}
-                                className="bg-emerald-600 hover:bg-emerald-500 text-slate-950 text-xs font-bold px-3 py-1.5 rounded-xl transition-all shadow-md active:scale-95 flex items-center gap-1"
-                              >
-                                <DollarSign className="w-3.5 h-3.5" />
-                                <span>জমা নিন</span>
-                              </button>
+                            {/* Main Admin Only Actions in Baki Khata */}
+                            {isMainAdmin && (
+                              <>
+                                {/* 2. Collect Payment */}
+                                {!isPaidFull && (
+                                  <button
+                                    onClick={() => setCollectingCustomer(cust)}
+                                    className="bg-emerald-600 hover:bg-emerald-500 text-slate-950 text-xs font-bold px-3 py-1.5 rounded-xl transition-all shadow-md active:scale-95 flex items-center gap-1"
+                                  >
+                                    <DollarSign className="w-3.5 h-3.5" />
+                                    <span>জমা নিন</span>
+                                  </button>
+                                )}
+
+                                {/* 3. View Full Ledger */}
+                                <button
+                                  onClick={() => setViewingLedgerCustomer(cust)}
+                                  className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold px-2.5 py-1.5 rounded-xl transition-all border border-slate-700"
+                                  title="পূর্ণাঙ্গ লেজার খতিয়ান দেখুন"
+                                >
+                                  লেজার
+                                </button>
+
+                                {/* 4. WhatsApp Reminder */}
+                                {cust.phone && (
+                                  <button
+                                    onClick={() => handleSendWhatsAppReminder(cust)}
+                                    className="p-1.5 text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 hover:bg-emerald-900 rounded-xl transition-colors"
+                                    title="হোয়াটসঅ্যাপে তাগাদা পাঠান"
+                                  >
+                                    <Share2 className="w-4 h-4" />
+                                  </button>
+                                )}
+
+                                {/* QR Code (WhatsApp & Contact Save) */}
+                                {cust.phone && (
+                                  <button
+                                    onClick={() => handleOpenCustomerQr(cust.name, cust.phone || '', pendingDue)}
+                                    className="p-1.5 text-amber-400 bg-amber-950/40 border border-amber-800/40 hover:bg-amber-900 rounded-xl transition-colors"
+                                    title="গ্রাহকের WhatsApp ও কন্টাক্ট QR কোড"
+                                  >
+                                    <QrCode className="w-4 h-4" />
+                                  </button>
+                                )}
+
+                                {/* 5. Print Slip */}
+                                <button
+                                  onClick={() => handlePrintStatement(cust)}
+                                  className="p-1.5 text-cyan-400 bg-cyan-950/40 border border-cyan-800/40 hover:bg-cyan-900 rounded-xl transition-colors"
+                                  title="স্টেটমেন্ট বা রসিদ"
+                                >
+                                  <Printer className="w-4 h-4" />
+                                </button>
+                              </>
                             )}
-
-                            {/* 3. View Full Ledger */}
-                            <button
-                              onClick={() => setViewingLedgerCustomer(cust)}
-                              className="bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold px-2.5 py-1.5 rounded-xl transition-all border border-slate-700"
-                              title="পূর্ণাঙ্গ লেজার খতিয়ান দেখুন"
-                            >
-                              লেজার
-                            </button>
-
-                            {/* 4. WhatsApp Reminder */}
-                            {cust.phone && (
-                              <button
-                                onClick={() => handleSendWhatsAppReminder(cust)}
-                                className="p-1.5 text-emerald-400 bg-emerald-950/40 border border-emerald-800/40 hover:bg-emerald-900 rounded-xl transition-colors"
-                                title="হোয়াটসঅ্যাপে তাগাদা পাঠান"
-                              >
-                                <Share2 className="w-4 h-4" />
-                              </button>
-                            )}
-
-                            {/* 5. Print Slip */}
-                            <button
-                              onClick={() => handlePrintStatement(cust)}
-                              className="p-1.5 text-cyan-400 bg-cyan-950/40 border border-cyan-800/40 hover:bg-cyan-900 rounded-xl transition-colors"
-                              title="স্টেটমেন্ট বা রসিদ"
-                            >
-                              <Printer className="w-4 h-4" />
-                            </button>
                           </div>
                         </div>
                       </div>
@@ -2563,12 +5006,14 @@ export default function App() {
                         <div className="mt-3 pt-2.5 border-t border-slate-800/60">
                           <div className="flex items-center justify-between text-[10px] text-slate-400 uppercase font-bold mb-1.5">
                             <span>সাম্প্রতিক লেনদেনের রেকর্ড:</span>
-                            <button
-                              onClick={() => setViewingLedgerCustomer(cust)}
-                              className="text-cyan-400 hover:underline lowercase font-normal"
-                            >
-                              সব দেখুন ({cust.history.length})
-                            </button>
+                            {isMainAdmin && (
+                              <button
+                                onClick={() => setViewingLedgerCustomer(cust)}
+                                className="text-cyan-400 hover:underline lowercase font-normal"
+                              >
+                                সব দেখুন ({cust.history.length})
+                              </button>
+                            )}
                           </div>
                           <div className="space-y-1">
                             {cust.history.slice(-2).reverse().map((h, idx) => (
@@ -2688,8 +5133,8 @@ export default function App() {
                     <span className="block text-2xl sm:text-3xl font-black text-emerald-400 font-mono mt-1">
                       ৳ {dashboardMetrics.revenue.toLocaleString()}
                     </span>
-                    <span className="text-[10px] text-slate-500 mt-1 block">
-                      পার্টস ও সার্ভিস মিলিয়ে সংগৃহীত টাকা
+                    <span className="text-[10px] text-slate-400 mt-1 block font-mono">
+                      বিক্রিকৃত মালের আসল কেনা পুঁজি: ৳ {dashboardMetrics.totalSalesCost.toLocaleString()} | লাভ: ৳ {dashboardMetrics.totalSalesProfit.toLocaleString()}
                     </span>
                   </div>
 
@@ -2701,7 +5146,7 @@ export default function App() {
                       {isPrivacyMode ? '••••••••' : `৳ ${(dashboardMetrics.netTrueProfit || dashboardMetrics.grossProfit || 0).toLocaleString()}`}
                     </span>
                     <span className="text-[10px] text-slate-400 mt-1 block">
-                      ক্রয়মূল্য ও সার্ভিস খরচ বাদে অর্জিত লাভ
+                      মাল কেনা ও খরচ বাদে হাতে নিট নগদ ক্যাশ: <strong className="text-cyan-300 font-mono">৳ {dashboardMetrics.netCashRemainingInHand.toLocaleString()}</strong>
                     </span>
                   </div>
 
@@ -2715,6 +5160,470 @@ export default function App() {
                     <span className="text-[10px] text-slate-400 mt-1 block">
                       {duesSummary.debtorCount} জন কাস্টমারের কাছে বাকি
                     </span>
+                  </div>
+                </div>
+
+                {/* ================= 🔄 CAPITAL VS PROFIT & OUTSIDE PURCHASE / RESTOCK TRACKER ================= */}
+                <div className="bg-gradient-to-br from-slate-900 via-slate-900/95 to-indigo-950/30 border border-cyan-500/30 rounded-3xl p-4 sm:p-6 shadow-2xl space-y-5">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-800/90 pb-4">
+                    <div className="flex items-start gap-3">
+                      <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-cyan-500/20 to-purple-500/20 border border-cyan-500/40 flex items-center justify-center text-cyan-400 flex-shrink-0 shadow-inner">
+                        <RefreshCw className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <h3 className="text-sm sm:text-base font-black text-slate-100">
+                            🔄 বিক্রির টাকায় পুনরায় মাল ক্রয় ও বাহিরের পার্টস হিসাব (পুঁজি বনাম লাভ)
+                          </h3>
+                          <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+                            হিসাব আর এলোমেলো হবে না
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                          স্টকের মাল বিক্রি করে যে টাকা আসে তার মধ্যে <strong className="text-amber-300">আসল কেনা পুঁজি কত</strong>, <strong className="text-emerald-300">লাভ কত</strong>, এবং <strong className="text-purple-300">ওই টাকা দিয়ে আবার অন্য জায়গা থেকে মাল কিনে আনলে বা লাগালে</strong> হাতে নিট কত টাকা থাকে—তার পরিষ্কার হিসাব।
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 5-Box Crystal Clear Cash & Capital Equation */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+                    {/* Step 1: Total Cash Received */}
+                    <div className="bg-slate-950/80 border border-slate-800 p-3.5 rounded-2xl relative">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-cyan-400 block">
+                        ১. বিক্রি থেকে নগদ ক্যাশ ইন
+                      </span>
+                      <span className="text-lg font-black font-mono text-slate-100 mt-1 block">
+                        ৳ {dashboardMetrics.totalCashInHandBeforeSpend.toLocaleString()}
+                      </span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">
+                        নগদ বিক্রি ৳{dashboardMetrics.totalSalesCashAmount.toLocaleString()} + সার্ভিস/বাকি আদায়
+                      </span>
+                    </div>
+
+                    {/* Step 2: Original Buying Cost (Capital) of Sold Goods */}
+                    <div className="bg-slate-950/80 border border-amber-500/30 p-3.5 rounded-2xl relative">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-amber-400 block">
+                        ২. বিক্রিকৃত মালের আসল পুঁজি (কেনা দাম)
+                      </span>
+                      <span className="text-lg font-black font-mono text-amber-300 mt-1 block">
+                        ৳ {dashboardMetrics.totalSalesCost.toLocaleString()}
+                      </span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">
+                        যেমন: ২০০০ টাকার ডিসপ্লের মধ্যে ৮০০ টাকা আসল পুঁজি
+                      </span>
+                    </div>
+
+                    {/* Step 3: True Profit from Sales */}
+                    <div className="bg-slate-950/80 border border-emerald-500/30 p-3.5 rounded-2xl relative">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400 block">
+                        ৩. বিক্রি থেকে প্রকৃত লাভ
+                      </span>
+                      <span className="text-lg font-black font-mono text-emerald-400 mt-1 block">
+                        + ৳ {dashboardMetrics.grossProfit.toLocaleString()}
+                      </span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">
+                        যেমন: ২০০০ - ৮০০ = ১২০০ টাকা লাভ
+                      </span>
+                    </div>
+
+                    {/* Step 4: Cash Spent to Buy Parts / Reinvest */}
+                    <div className="bg-slate-950/80 border border-purple-500/40 p-3.5 rounded-2xl relative">
+                      <span className="text-[10px] font-bold uppercase tracking-wider text-purple-300 block">
+                        ৪. ক্যাশ থেকে পুনরায় মাল কেনা
+                      </span>
+                      <span className="text-lg font-black font-mono text-purple-400 mt-1 block">
+                        - ৳ {dashboardMetrics.totalCashReinvested.toLocaleString()}
+                      </span>
+                      <span className="text-[10px] text-slate-400 block mt-0.5">
+                        অন্য দোকান থেকে পার্টস কিনতে ক্যাশ খরচ
+                      </span>
+                    </div>
+
+                    {/* Step 5: Final Net Cash Remaining in Hand */}
+                    <div className="bg-gradient-to-br from-cyan-950/60 via-slate-950 to-emerald-950/40 border-2 border-cyan-500/50 p-3.5 rounded-2xl shadow-lg">
+                      <span className="text-[10px] font-black uppercase tracking-wider text-cyan-300 block">
+                        ৫. মাল কেনার পর হাতে নিট ক্যাশ
+                      </span>
+                      <span className="text-xl font-black font-mono text-cyan-300 mt-1 block">
+                        = ৳ {dashboardMetrics.netCashRemainingInHand.toLocaleString()}
+                      </span>
+                      <span className="text-[10px] text-cyan-200/80 block mt-0.5">
+                        (ক্যাশ ইন - মাল কেনা ৳{dashboardMetrics.totalCashReinvested} - খরচ ৳{dashboardMetrics.totalExpenseAmount})
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Quick Entry Form + Live Ledger */}
+                  <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 pt-1">
+                    {/* Left 7 Cols: Entry Form */}
+                    <div className="lg:col-span-7 bg-slate-950/90 border border-slate-800 rounded-2xl p-4 space-y-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                        <h4 className="text-xs sm:text-sm font-bold text-slate-200 flex items-center gap-2">
+                          <Plus className="w-4 h-4 text-cyan-400" />
+                          <span>নতুন মাল কেনা / বাহির থেকে এনে বিক্রি এন্ট্রি করুন</span>
+                        </h4>
+                        <div className="flex bg-slate-900 p-1 rounded-xl border border-slate-800 text-[11px] font-bold">
+                          <button
+                            type="button"
+                            onClick={() => setReinvestMode('instant_sell')}
+                            className={`px-2.5 py-1.5 rounded-lg transition-all ${
+                              reinvestMode === 'instant_sell'
+                                ? 'bg-gradient-to-r from-cyan-500 to-blue-600 text-slate-950 shadow'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            ⚡ বাহির থেকে এনে তাৎক্ষণিক বিক্রি
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setReinvestMode('restock')}
+                            className={`px-2.5 py-1.5 rounded-lg transition-all ${
+                              reinvestMode === 'restock'
+                                ? 'bg-gradient-to-r from-purple-500 to-indigo-600 text-white shadow'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            📦 বিক্রির টাকায় স্টক ক্রয়
+                          </button>
+                        </div>
+                      </div>
+
+                      {reinvestMode === 'instant_sell' ? (
+                        <div className="bg-cyan-950/25 border border-cyan-500/20 rounded-xl px-3 py-2 text-[11px] text-cyan-200/90 leading-relaxed">
+                          💡 <strong>আপনার উদাহরণ:</strong> আরেকটা ডিসপ্লে লাগাতে হবে যেটা আপনার স্টকে নেই। অন্য জায়গা থেকে <strong>৳৮০০</strong> দিয়ে কিনে এনে কাস্টমারকে <strong>৳২০০০</strong> টাকায় লাগিয়ে দিলেন। এখানে লিখে সেভ করলেই ক্যাশ থেকে <strong>-৳৮০০</strong> মাল কেনা এবং <strong>+৳২০০০</strong> বিক্রি ও <strong>+৳১২০০</strong> লাভ অটো হিসাব হয়ে যাবে!
+                        </div>
+                      ) : (
+                        <div className="bg-purple-950/25 border border-purple-500/20 rounded-xl px-3 py-2 text-[11px] text-purple-200/90 leading-relaxed">
+                          💡 <strong>উদাহরণ:</strong> ডিসপ্লে <strong>৳২০০০</strong> টাকায় বিক্রি করার পর সেই ক্যাশ টাকা থেকে <strong>৳৮০০</strong> দিয়ে আবার নতুন মাল কিনে দোকানে স্টক করলেন। এখানে এন্ট্রি দিলে ক্যাশ থেকে <strong>-৳৮০০</strong> মাল ক্রয় হিসেবে হিসাব থাকবে এবং স্টকে <strong>+১ পিস</strong> যোগ হবে!
+                        </div>
+                      )}
+
+                      <form onSubmit={handleSaveCashPurchase} className="space-y-3">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                              মালের নাম / মডেল লিখুন *
+                            </label>
+                            <input
+                              type="text"
+                              value={reinvestItemName}
+                              onChange={e => setReinvestItemName(e.target.value)}
+                              placeholder="যেমন: Vivo Y20 Display / শর্ট পার্টস"
+                              className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+                              required={!reinvestSelectedItemId}
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                              অথবা স্টকের মাল সিলেক্ট করুন (ঐচ্ছিক)
+                            </label>
+                            <select
+                              value={reinvestSelectedItemId}
+                              onChange={e => {
+                                const id = e.target.value;
+                                setReinvestSelectedItemId(id);
+                                const found = inventory.find(i => i.id === id);
+                                if (found) {
+                                  setReinvestItemName(found.name);
+                                  if (found.price) setReinvestBuyPrice(String(found.price));
+                                  if (found.sellingPrice) setReinvestSellPrice(String(found.sellingPrice));
+                                }
+                              }}
+                              className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500"
+                            >
+                              <option value="">-- নতুন / বাহিরের পার্টস --</option>
+                              {inventory.map(item => (
+                                <option key={item.id} value={item.id}>
+                                  {item.name} (স্টক: {item.stock}, কেনা: ৳{item.price})
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-3">
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                              পরিমাণ (পিস) *
+                            </label>
+                            <input
+                              type="number"
+                              min="1"
+                              value={reinvestQty}
+                              onChange={e => setReinvestQty(e.target.value)}
+                              className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono font-bold text-slate-100 focus:outline-none focus:border-cyan-500"
+                              required
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[11px] font-semibold text-amber-400 mb-1">
+                              কেনা দাম / প্রতি পিস (৳) *
+                            </label>
+                            <input
+                              type="number"
+                              min="1"
+                              step="any"
+                              value={reinvestBuyPrice}
+                              onChange={e => setReinvestBuyPrice(e.target.value)}
+                              placeholder="যেমন: 800"
+                              className="w-full bg-slate-900 border border-amber-500/40 rounded-xl px-3 py-2 text-xs font-mono font-bold text-amber-300 focus:outline-none focus:border-amber-400"
+                              required
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-[11px] font-semibold text-emerald-400 mb-1">
+                              {reinvestMode === 'instant_sell' ? 'কাস্টমার দিল / বিক্রয় (৳) *' : 'সম্ভাব্য বিক্রয় দাম (৳)'}
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              step="any"
+                              value={reinvestSellPrice}
+                              onChange={e => setReinvestSellPrice(e.target.value)}
+                              placeholder="যেমন: 2000"
+                              className="w-full bg-slate-900 border border-emerald-500/40 rounded-xl px-3 py-2 text-xs font-mono font-bold text-emerald-400 focus:outline-none focus:border-emerald-400"
+                              required={reinvestMode === 'instant_sell'}
+                            />
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div>
+                            <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                              কোন জায়গা / দোকান থেকে কিনে আনলেন? (ঐচ্ছিক)
+                            </label>
+                            <input
+                              type="text"
+                              value={reinvestSupplier}
+                              onChange={e => setReinvestSupplier(e.target.value)}
+                              placeholder="যেমন: পাশের দোকান / মার্কেট"
+                              className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500"
+                            />
+                          </div>
+
+                          {reinvestMode === 'instant_sell' && (
+                            <div>
+                              <label className="block text-[11px] font-semibold text-slate-400 mb-1">
+                                কাস্টমারের নাম / বিবরণ (ঐচ্ছিক)
+                              </label>
+                              <input
+                                type="text"
+                                value={reinvestCustomer}
+                                onChange={e => setReinvestCustomer(e.target.value)}
+                                placeholder="যেমন: ডিসপ্লে ফিটিং কাস্টমার"
+                                className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500"
+                              />
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Live Preview Banner before Submit */}
+                        {(parseFloat(reinvestBuyPrice) || 0) > 0 && (
+                          <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3 flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div>
+                              <span className="text-slate-400">ক্যাশ থেকে মাল কিনতে খরচ: </span>
+                              <strong className="font-mono text-purple-400">
+                                - ৳ {((parseInt(reinvestQty) || 1) * (parseFloat(reinvestBuyPrice) || 0)).toLocaleString()}
+                              </strong>
+                            </div>
+                            {reinvestMode === 'instant_sell' && (parseFloat(reinvestSellPrice) || 0) > 0 && (
+                              <>
+                                <div>
+                                  <span className="text-slate-400">কাস্টমার থেকে ক্যাশ ইন: </span>
+                                  <strong className="font-mono text-cyan-400">
+                                    + ৳ {((parseInt(reinvestQty) || 1) * (parseFloat(reinvestSellPrice) || 0)).toLocaleString()}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span className="text-slate-400">নিট লাভ থাকবে: </span>
+                                  <strong className="font-mono text-emerald-400">
+                                    + ৳ {((parseInt(reinvestQty) || 1) * ((parseFloat(reinvestSellPrice) || 0) - (parseFloat(reinvestBuyPrice) || 0))).toLocaleString()}
+                                  </strong>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        )}
+
+                        <button
+                          type="submit"
+                          className={`w-full py-2.5 px-4 rounded-xl font-black text-xs shadow-lg transition-all active:scale-95 flex items-center justify-center gap-2 ${
+                            reinvestMode === 'instant_sell'
+                              ? 'bg-gradient-to-r from-cyan-500 to-emerald-500 hover:from-cyan-400 hover:to-emerald-400 text-slate-950'
+                              : 'bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white'
+                          }`}
+                        >
+                          <CheckCircle2 className="w-4 h-4" />
+                          <span>
+                            {reinvestMode === 'instant_sell'
+                              ? 'বাহির থেকে কিনে তাৎক্ষণিক বিক্রি ও লাভের হিসাব সেভ করুন'
+                              : 'বিক্রির ক্যাশ টাকা দিয়ে মাল ক্রয় ও স্টকে যোগ করুন'}
+                          </span>
+                        </button>
+                      </form>
+                    </div>
+
+                    {/* Right 5 Cols: Recent Reinvestment & Outside Purchases Ledger */}
+                    <div className="lg:col-span-5 bg-slate-950/90 border border-slate-800 rounded-2xl p-4 flex flex-col justify-between space-y-3">
+                      <div>
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-2.5 mb-3">
+                          <h4 className="text-xs sm:text-sm font-bold text-slate-200 flex items-center gap-2">
+                            <ClipboardList className="w-4 h-4 text-purple-400" />
+                            <span>পুনরায় মাল ক্রয় ও বাহিরের পার্টস খতিয়ান</span>
+                          </h4>
+                          <span className="text-[11px] font-mono font-bold text-purple-400 bg-purple-950/50 px-2 py-0.5 rounded-lg border border-purple-500/30">
+                            মোট কেনা: ৳{dashboardMetrics.totalCashReinvested.toLocaleString()}
+                          </span>
+                        </div>
+
+                        {dashboardMetrics.filteredCashPurchases.length === 0 ? (
+                          <div className="text-center py-8 px-3 border border-dashed border-slate-800 rounded-2xl">
+                            <p className="text-xs text-slate-400 font-semibold">
+                              এই সময়ে বিক্রির টাকা দিয়ে পুনরায় মাল কেনা বা বাহিরের পার্টস এন্ট্রি নেই।
+                            </p>
+                            <p className="text-[11px] text-slate-500 mt-1">
+                              বাম পাশের ফর্ম দিয়ে এন্ট্রি করলেই এখানে বিস্তারিত হিসাব দেখাবে।
+                            </p>
+                          </div>
+                        ) : (
+                          <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                            {dashboardMetrics.filteredCashPurchases.map(cp => {
+                              const profit = cp.isSold && cp.sellingPrice
+                                ? cp.qty * (cp.sellingPrice - cp.unitCost)
+                                : 0;
+                              return (
+                                <div
+                                  key={cp.id}
+                                  className="p-3 rounded-xl bg-slate-900/90 border border-slate-800/90 flex flex-col gap-2 text-xs"
+                                >
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div>
+                                      <div className="font-bold text-slate-100 flex items-center gap-1.5 flex-wrap">
+                                        <span>{cp.itemName}</span>
+                                        <span className="text-[10px] font-mono bg-slate-800 text-cyan-300 px-1.5 py-0.5 rounded">
+                                          x{cp.qty}
+                                        </span>
+                                        {cp.type === 'instant_sell' ? (
+                                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                                            ⚡ এনে তাৎক্ষণিক বিক্রি
+                                          </span>
+                                        ) : (
+                                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/30">
+                                            📦 ক্যাশ দিয়ে স্টক ক্রয়
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-[10px] text-slate-400 mt-0.5">
+                                        {cp.date} • উৎস: {cp.supplierName || 'মার্কেট'}
+                                        {cp.customerName ? ` • কাস্টমার: ${cp.customerName}` : ''}
+                                      </div>
+                                    </div>
+
+                                    <div className="text-right flex-shrink-0">
+                                      <div className="font-mono font-bold text-purple-400">
+                                        কেনা: -৳{cp.totalCost.toLocaleString()}
+                                      </div>
+                                      {cp.isSold && cp.sellingPrice ? (
+                                        <div className="text-[10px] font-mono text-emerald-400 font-bold">
+                                          বিক্রি: +৳{(cp.qty * cp.sellingPrice).toLocaleString()} (লাভ: ৳{profit})
+                                        </div>
+                                      ) : (
+                                        <div className="text-[10px] text-amber-400">স্টকে জমা আছে</div>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {sellingPurchaseId === cp.id ? (
+                                    <div className="flex items-center gap-1.5 pt-1.5 border-t border-slate-800/70">
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        step="any"
+                                        value={sellingPurchaseRate}
+                                        onChange={e => setSellingPurchaseRate(e.target.value)}
+                                        placeholder="বিক্রয় দর (৳)"
+                                        className="w-28 bg-slate-950 border border-emerald-500/50 rounded-lg px-2 py-1 text-xs font-mono text-emerald-300 focus:outline-none"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => handleConfirmSellFromPurchase(cp)}
+                                        className="px-2.5 py-1 rounded-lg bg-emerald-500 text-slate-950 font-bold text-[10px]"
+                                      >
+                                        কনফার্ম বিক্রি
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSellingPurchaseId(null);
+                                          setSellingPurchaseRate('');
+                                        }}
+                                        className="text-slate-400 hover:text-white text-[10px] px-1.5"
+                                      >
+                                        বাতিল
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div className="flex items-center justify-between pt-1.5 border-t border-slate-800/70">
+                                      {!cp.isSold ? (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setSellingPurchaseId(cp.id);
+                                            setSellingPurchaseRate(
+                                              String(cp.sellingPrice && cp.sellingPrice > cp.unitCost ? cp.sellingPrice : cp.unitCost + 500)
+                                            );
+                                          }}
+                                          className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold transition-colors"
+                                        >
+                                          🛒 এখন কাস্টমারকে বিক্রি করুন
+                                        </button>
+                                      ) : (
+                                        <span className="text-[10px] text-emerald-400/90 font-semibold flex items-center gap-1">
+                                          <CheckCircle2 className="w-3 h-3" /> বিক্রি ও লাভের খাতায় যুক্ত হয়েছে
+                                        </span>
+                                      )}
+
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteCashPurchase(cp)}
+                                        className="text-slate-500 hover:text-red-400 p-1 transition-colors"
+                                        title="মুছে ফেলুন"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Clear summary footer inside right card */}
+                      <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-3 text-[11px] space-y-1">
+                        <div className="flex justify-between text-slate-400">
+                          <span>মোট নগদ ক্যাশ এসেছিল:</span>
+                          <span className="font-mono font-bold text-slate-200">৳ {dashboardMetrics.totalCashInHandBeforeSpend.toLocaleString()}</span>
+                        </div>
+                        <div className="flex justify-between text-purple-300">
+                          <span>পুনরায় মাল কিনতে ক্যাশ খরচ:</span>
+                          <span className="font-mono font-bold">- ৳ {dashboardMetrics.totalCashReinvested.toLocaleString()}</span>
+                        </div>
+                        <div className="flex justify-between text-red-300">
+                          <span>দোকানের অন্যান্য খরচ:</span>
+                          <span className="font-mono font-bold">- ৳ {dashboardMetrics.totalExpenseAmount.toLocaleString()}</span>
+                        </div>
+                        <div className="flex justify-between text-cyan-300 font-bold pt-1 border-t border-slate-800">
+                          <span>এখন হাতে/ড্রয়ারে নিট নগদ টাকা:</span>
+                          <span className="font-mono text-sm">৳ {dashboardMetrics.netCashRemainingInHand.toLocaleString()}</span>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -2769,79 +5678,200 @@ export default function App() {
             )}
           </div>
         )}
+
+        {/* ================= TAB 5: PRE-ORDERS & PRODUCT DEMANDS ================= */}
+        {activeTab === 'preorders' && (
+          <PreOrdersView
+            orders={productPreOrders}
+            onOpenAdd={handleOpenAddPreOrder}
+            onOpenEdit={handleOpenEditPreOrder}
+            onDelete={handleDeletePreOrder}
+            onUpdateStatus={handleUpdatePreOrderStatus}
+            onPrintSlip={(receipt) => setReceiptData(receipt)}
+            activeSeller={activeSeller}
+            onAddExtraAdvance={handleAddExtraAdvance}
+            onSettleBalance={handleSettlePreOrderBalance}
+          />
+        )}
       </main>
 
-      {/* ================= MODAL: LOGIN ================= */}
-      {isLoginModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-md flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm p-6 shadow-2xl text-center space-y-5 animate-in fade-in zoom-in-95 duration-200">
-            <div className="w-14 h-14 bg-cyan-500/10 text-cyan-400 rounded-2xl flex items-center justify-center mx-auto border border-cyan-500/20">
-              <Lock className="w-7 h-7" />
+      {/* ================= MODAL: IMPROVED LOGIN & ROLE ACCESS ================= */}
+      {(isLoginModalOpen || userRole === 'guest') && (
+        <div className="fixed inset-0 z-50 bg-slate-950/95 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md p-6 shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-200">
+            <div className="text-center space-y-2">
+              <div className="w-14 h-14 bg-gradient-to-br from-cyan-500/20 to-blue-600/20 text-cyan-400 rounded-2xl flex items-center justify-center mx-auto border border-cyan-500/30 shadow-inner">
+                <Lock className="w-7 h-7" />
+              </div>
+              <div>
+                <h2 className="text-lg font-black text-slate-100">অনিক টেলিকম • সিকিউরিটি লগইন</h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  আপনার অ্যাকাউন্ট নির্বাচন করে পাসওয়ার্ড দিন
+                </p>
+              </div>
             </div>
-            <div>
-              <h2 className="text-lg font-black text-slate-100">Anik Telecom Control Panel</h2>
-              <p className="text-xs text-slate-400 mt-1">
-                লগইন করতে আপনার এডমিন PIN লিখুন
-              </p>
-            </div>
-            <form onSubmit={handleLoginSubmit} className="space-y-4">
-              <input
-                type="password"
-                value={enteredPin}
-                onChange={e => {
-                  setEnteredPin(e.target.value);
-                  setLoginError(false);
-                }}
-                placeholder="Enter PIN"
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-center text-xl tracking-widest text-cyan-400 focus:outline-none focus:border-cyan-500 font-mono font-bold"
-                required
-                autoFocus
-              />
-              {loginError && (
-                <div className="text-xs text-red-400 font-semibold">
-                  ভুল PIN! অনুগ্রহ করে আবার চেষ্টা করুন।
-                </div>
-              )}
+
+            {/* Account Selector Tabs: Anik (Main Admin) vs Parvej (Sub Admin) */}
+            <div className="grid grid-cols-2 gap-2.5 bg-slate-950 p-1.5 rounded-2xl border border-slate-800">
               <button
-                type="submit"
-                className="w-full bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950 font-black py-3 rounded-xl transition-all shadow-lg text-sm"
-              >
-                Login System
-              </button>
-            </form>
-            <div className="pt-1">
-              <button
+                type="button"
                 onClick={() => {
-                  setIsLoginModalOpen(false);
+                  setSelectedLoginUser('Anik');
                   setEnteredPin('');
                   setLoginError(false);
                 }}
-                className="text-xs text-slate-500 hover:text-slate-300 underline"
+                className={`p-3 rounded-xl text-left transition-all border ${
+                  selectedLoginUser === 'Anik'
+                    ? 'bg-gradient-to-br from-cyan-500/20 to-blue-600/20 border-cyan-500 text-cyan-300 shadow-lg'
+                    : 'bg-slate-900/60 border-transparent text-slate-400 hover:text-slate-200'
+                }`}
               >
-                বন্ধ করুন
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black text-slate-100">👑 Anik</span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-bold">
+                    Main Admin
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1 leading-tight">
+                  পূর্ণ নিয়ন্ত্রণ ও সকল হিসাব এক্সেস
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setSelectedLoginUser('Parvej');
+                  setEnteredPin('');
+                  setLoginError(false);
+                }}
+                className={`p-3 rounded-xl text-left transition-all border ${
+                  selectedLoginUser === 'Parvej'
+                    ? 'bg-gradient-to-br from-amber-500/20 to-orange-600/20 border-amber-500 text-amber-300 shadow-lg'
+                    : 'bg-slate-900/60 border-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black text-slate-100">🛡️ Parvej</span>
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 font-bold">
+                    Sub Admin
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-400 mt-1 leading-tight">
+                  শুধু সেল, স্টক ও বাকি এন্ট্রি
+                </p>
               </button>
             </div>
+
+            {/* Role Permission Info Box */}
+            <div className={`p-3 rounded-2xl border text-xs space-y-1 ${
+              selectedLoginUser === 'Anik'
+                ? 'bg-cyan-950/30 border-cyan-800/50 text-cyan-200'
+                : 'bg-amber-950/30 border-amber-800/50 text-amber-200'
+            }`}>
+              {selectedLoginUser === 'Anik' ? (
+                <>
+                  <p className="font-bold text-cyan-300">👑 Main Admin (Anik) সুবিধাসমূহ:</p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    ✓ কেনা দাম দেখা, লাভ-ক্ষতি ড্যাশবোর্ড, ক্যাশ ড্রয়ার, মহাজন খাতা, সার্ভিস ও সকল ডাটা এডিট/ডিলিট করার পূর্ণ ক্ষমতা।
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-bold text-amber-300">🛡️ Sub Admin (Parvej) অনুমোদিত এক্সেস:</p>
+                  <p className="text-[11px] text-slate-300 leading-relaxed">
+                    ✓ শুধুমাত্র <strong>১. সেল এন্ট্রি (বিক্রি)</strong>, <strong>২. স্টক এন্ট্রি (মালামাল যোগ)</strong> এবং <strong>৩. বাকি এন্ট্রি</strong>। (কেনা দাম, লাভ ও ডিলিট অপশন বন্ধ থাকবে)
+                  </p>
+                </>
+              )}
+            </div>
+
+            <form onSubmit={handleLoginSubmit} className="space-y-4">
+              <div>
+                <label className="block text-[11px] font-bold text-slate-400 mb-1.5 text-left">
+                  {selectedLoginUser === 'Anik' ? 'Anik (Main Admin) পাসওয়ার্ড দিন:' : 'Parvej (Sub Admin) পাসওয়ার্ড দিন:'}
+                </label>
+                <div className="relative">
+                  <input
+                    type={showLoginPassword ? 'text' : 'password'}
+                    inputMode="numeric"
+                    value={enteredPin}
+                    onChange={e => {
+                      setEnteredPin(e.target.value);
+                      setLoginError(false);
+                    }}
+                    placeholder={selectedLoginUser === 'Anik' ? 'Main Admin Password' : 'Sub Admin Password'}
+                    className="w-full bg-slate-950 border-2 border-slate-800 rounded-xl pl-4 pr-11 py-3 text-center text-xl tracking-widest text-cyan-400 focus:outline-none focus:border-cyan-500 font-mono font-bold"
+                    required
+                    autoFocus
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPassword(!showLoginPassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1"
+                    title={showLoginPassword ? 'পাসওয়ার্ড লুকান' : 'পাসওয়ার্ড দেখুন'}
+                  >
+                    {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              {loginError && (
+                <div className="p-2.5 rounded-xl bg-red-950/60 border border-red-800 text-xs text-red-300 font-bold text-center">
+                  ❌ ভুল পাসওয়ার্ড! সঠিক পাসওয়ার্ড দিয়ে আবার চেষ্টা করুন।
+                </div>
+              )}
+
+              <button
+                type="submit"
+                className={`w-full font-black py-3 rounded-xl transition-all shadow-lg text-sm active:scale-98 ${
+                  selectedLoginUser === 'Anik'
+                    ? 'bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-slate-950'
+                    : 'bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-slate-950'
+                }`}
+              >
+                {selectedLoginUser === 'Anik' ? '👑 Anik হিসেবে লগইন করুন' : '🛡️ Parvej হিসেবে লগইন করুন'}
+              </button>
+            </form>
+
+            {userRole !== 'guest' && (
+              <div className="pt-1 text-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsLoginModalOpen(false);
+                    setEnteredPin('');
+                    setLoginError(false);
+                  }}
+                  className="text-xs text-slate-400 hover:text-slate-200 underline font-semibold"
+                >
+                  বন্ধ করুন
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}
 
       {/* ================= MODAL: ADD / EDIT ITEM ================= */}
       {isItemModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200 my-auto">
             <div className="flex justify-between items-center p-4 border-b border-slate-800 bg-slate-950/40">
               <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
                 <Boxes className="w-4 h-4 text-cyan-400" />
                 <span>{editingItem ? 'মালামাল এডিট করুন' : 'নতুন মালামাল ও পার্টস যোগ'}</span>
               </h3>
               <button
-                onClick={() => setIsItemModalOpen(false)}
+                onClick={() => {
+                  setIsItemInlineScannerOpen(false);
+                  setIsItemModalOpen(false);
+                }}
                 className="text-slate-400 hover:text-white bg-slate-800/80 rounded-full p-1.5"
               >
                 ✕
               </button>
             </div>
-            <form onSubmit={handleSaveItem} className="p-5 space-y-3.5">
+            <form onSubmit={handleSaveItem} className="p-5 space-y-3.5 max-h-[85vh] overflow-y-auto">
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-[11px] font-semibold text-slate-400 mb-1">ক্যাটাগরি</label>
@@ -2873,17 +5903,102 @@ export default function App() {
                     {availableBrands.map((b, idx) => <option key={`brand_dl_${b}_${idx}`} value={b} />)}
                   </datalist>
                 </div>
+                <div className="col-span-2 flex flex-wrap items-center gap-1 pt-0.5">
+                  <span className="text-[10px] text-slate-500 mr-1 font-semibold">কুইক সিলেক্ট:</span>
+                  {[
+                    { id: 'Display', label: '📱 ডিসপ্লে' },
+                    { id: 'Battery', label: '🔋 ব্যাটারি' },
+                    { id: 'Sub Charging Board', label: '⚡ চার্জিং বোর্ড' },
+                    { id: 'Back Shell', label: '🛡️ ব্যাকশেল' },
+                    { id: 'Camera', label: '📷 ক্যামেরা' },
+                    { id: 'Flex Cable', label: '🔌 ফ্লেক্স' },
+                    { id: 'Charger', label: '🔌 চার্জার' },
+                    { id: 'Cable', label: '⚡ ডাটা কেবল' },
+                    { id: 'Earphones', label: '🎧 ইয়ারফোন' }
+                  ].map(qc => (
+                    <button
+                      key={`qc_btn_${qc.id}`}
+                      type="button"
+                      onClick={() => setItemFormData(prev => ({ ...prev, category: qc.id }))}
+                      className={`text-[10px] px-2 py-0.5 rounded-lg border font-bold transition-colors ${
+                        itemFormData.category.toLowerCase() === qc.id.toLowerCase()
+                          ? 'bg-cyan-500 text-slate-950 border-cyan-400 font-black shadow-sm'
+                          : 'bg-slate-900 text-slate-400 hover:text-slate-200 border-slate-800'
+                      }`}
+                    >
+                      {qc.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div>
-                <label className="block text-[11px] font-semibold text-slate-400 mb-1">প্রোডাক্ট কোড / SKU (ঐচ্ছিক)</label>
-                <input
-                  type="text"
-                  value={itemFormData.sku}
-                  onChange={e => setItemFormData({ ...itemFormData, sku: e.target.value })}
-                  placeholder="যেমন: AT-DISP-01"
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 font-mono focus:outline-none focus:border-cyan-500"
-                />
+                <div className="flex items-center justify-between gap-2 mb-1.5">
+                  <label className="block text-[11px] font-semibold text-slate-400">
+                    প্রোডাক্ট কোড / বারকোড (SKU)
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const prefix = (itemFormData.category || 'PART').slice(0, 3).toUpperCase();
+                        const generated = `AT-${prefix}-${Math.floor(1000 + Math.random() * 9000)}`;
+                        setItemFormData(prev => ({ ...prev, sku: generated }));
+                        showToast(`অটো বারকোড তৈরি হয়েছে: ${generated}`, 'info');
+                      }}
+                      className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-300 font-bold transition-colors"
+                      title="নতুন র‍্যান্ডম বারকোড তৈরি করুন"
+                    >
+                      ⚡ অটো কোড
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsItemInlineScannerOpen(prev => !prev)}
+                      className={`px-2.5 py-1 rounded-lg text-[10px] font-black flex items-center gap-1 transition-all border ${
+                        isItemInlineScannerOpen
+                          ? 'bg-red-500/20 text-red-300 border-red-500/40'
+                          : 'bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border-cyan-500/40 shadow-sm'
+                      }`}
+                    >
+                      <ScanBarcode className="w-3.5 h-3.5" />
+                      <span>{isItemInlineScannerOpen ? 'স্ক্যানার বন্ধ করুন' : 'বারকোড স্ক্যানার খুলুন'}</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Inline Live Camera Barcode Scanner (auto-fills itemFormData.sku on scan) */}
+                {isItemInlineScannerOpen && (
+                  <InlineBarcodeScanner
+                    onScanned={scannedCode => {
+                      setItemFormData(prev => ({ ...prev, sku: scannedCode }));
+                      setIsItemInlineScannerOpen(false);
+                      showToast(`✅ বারকোড স্ক্যান হয়ে অটো যুক্ত হয়েছে: ${scannedCode}`, 'success');
+                    }}
+                    onClose={() => setIsItemInlineScannerOpen(false)}
+                  />
+                )}
+
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={itemFormData.sku}
+                    onChange={e => setItemFormData({ ...itemFormData, sku: e.target.value })}
+                    placeholder="যেমন: AT-DISP-01 বা উপরের বারকোড স্ক্যানার বাটনে চাপুন"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-3 pr-10 py-2 text-xs text-cyan-300 font-mono font-bold focus:outline-none focus:border-cyan-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setIsItemInlineScannerOpen(prev => !prev)}
+                    className={`absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded-lg transition-colors ${
+                      isItemInlineScannerOpen
+                        ? 'bg-cyan-500 text-slate-950'
+                        : 'text-cyan-400 hover:bg-slate-800'
+                    }`}
+                    title="বারকোড স্ক্যান করে অটো বক্সে নিন"
+                  >
+                    <ScanBarcode className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
 
               <div>
@@ -2912,36 +6027,43 @@ export default function App() {
                 />
               </div>
 
-              <div className="grid grid-cols-3 gap-2">
+              <div className={`grid ${editingItem && !isMainAdmin ? 'grid-cols-2' : 'grid-cols-3'} gap-2`}>
                 <div>
                   <label className="block text-[10px] font-semibold text-slate-400 mb-1">স্টক পরিমাণ</label>
                   <input
                     type="number"
                     min="0"
+                    placeholder="0"
                     value={itemFormData.stock}
-                    onChange={e => setItemFormData({ ...itemFormData, stock: parseInt(e.target.value) || 0 })}
+                    onChange={e => setItemFormData({ ...itemFormData, stock: e.target.value })}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2 py-2 text-xs text-slate-100 font-mono font-bold focus:outline-none focus:border-cyan-500"
                     required
                   />
                 </div>
-                <div>
-                  <label className="block text-[10px] font-semibold text-slate-400 mb-1">ক্রয়মূল্য (৳)</label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={itemFormData.price}
-                    onChange={e => setItemFormData({ ...itemFormData, price: parseFloat(e.target.value) || 0 })}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2 py-2 text-xs text-cyan-400 font-mono font-bold focus:outline-none focus:border-cyan-500"
-                    required
-                  />
-                </div>
+                {(!editingItem || isMainAdmin) && (
+                  <div>
+                    <label className="block text-[10px] font-semibold text-slate-400 mb-1">ক্রয়মূল্য (৳)</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="any"
+                      placeholder="0"
+                      value={itemFormData.price}
+                      onChange={e => setItemFormData({ ...itemFormData, price: e.target.value })}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2 py-2 text-xs text-cyan-400 font-mono font-bold focus:outline-none focus:border-cyan-500"
+                      required={isMainAdmin}
+                    />
+                  </div>
+                )}
                 <div>
                   <label className="block text-[10px] font-semibold text-slate-400 mb-1">বিক্রয়মূল্য (৳)</label>
                   <input
                     type="number"
                     min="0"
+                    step="any"
+                    placeholder="0"
                     value={itemFormData.sellingPrice}
-                    onChange={e => setItemFormData({ ...itemFormData, sellingPrice: parseFloat(e.target.value) || 0 })}
+                    onChange={e => setItemFormData({ ...itemFormData, sellingPrice: e.target.value })}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-2 py-2 text-xs text-emerald-400 font-mono font-bold focus:outline-none focus:border-cyan-500"
                     required
                   />
@@ -2994,8 +6116,9 @@ export default function App() {
                     type="number"
                     min="1"
                     max={sellingItem.stock}
+                    placeholder="1"
                     value={sellQty}
-                    onChange={e => setSellQty(parseInt(e.target.value) || 1)}
+                    onChange={e => setSellQty(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm font-mono font-bold text-slate-100 focus:outline-none focus:border-emerald-500"
                     required
                   />
@@ -3005,8 +6128,10 @@ export default function App() {
                   <input
                     type="number"
                     min="0"
+                    step="any"
+                    placeholder="0"
                     value={sellPrice}
-                    onChange={e => setSellPrice(parseFloat(e.target.value) || 0)}
+                    onChange={e => setSellPrice(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm font-mono font-bold text-emerald-400 focus:outline-none focus:border-emerald-500"
                     required
                   />
@@ -3031,7 +6156,7 @@ export default function App() {
               <div className="bg-slate-950/80 p-3 rounded-xl border border-slate-800 flex justify-between items-center text-xs">
                 <span className="text-slate-400">সর্বমোট বিক্রয় বিল:</span>
                 <span className="text-base font-black font-mono text-emerald-400">
-                  ৳ {(sellQty * sellPrice).toLocaleString()}
+                  ৳ {((Number(sellQty) || 0) * (Number(sellPrice) || 0)).toLocaleString()}
                 </span>
               </div>
 
@@ -3075,9 +6200,10 @@ export default function App() {
                       <input
                         type="number"
                         min="0"
-                        max={sellQty * sellPrice}
+                        step="any"
+                        max={(Number(sellQty) || 0) * (Number(sellPrice) || 0)}
                         value={sellPaidNow}
-                        onChange={e => setSellPaidNow(parseFloat(e.target.value) || 0)}
+                        onChange={e => setSellPaidNow(e.target.value)}
                         placeholder="0"
                         className="w-full bg-slate-900 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-emerald-400 font-bold font-mono"
                       />
@@ -3085,7 +6211,7 @@ export default function App() {
                     <div className="flex justify-between items-center text-[11px] pt-1">
                       <span className="text-slate-400">অবশিষ্ট বাকি থাকবে:</span>
                       <span className="font-mono font-bold text-red-400">
-                        ৳ {Math.max(0, (sellQty * sellPrice) - sellPaidNow).toLocaleString()}
+                        ৳ {Math.max(0, ((Number(sellQty) || 0) * (Number(sellPrice) || 0)) - (Number(sellPaidNow) || 0)).toLocaleString()}
                       </span>
                     </div>
                   </div>
@@ -3106,40 +6232,61 @@ export default function App() {
         </div>
       )}
 
-      {/* ================= MODAL: NEW SERVICE ================= */}
+      {/* ================= MODAL: NEW / EDIT SERVICE & LOAD ================= */}
       {isServiceModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
             <div className="flex justify-between items-center p-4 border-b border-slate-800 bg-slate-950/40">
-              <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
-                <Wrench className="w-4 h-4 text-blue-400" />
-                <span>নতুন সার্ভিসিং ও ডিজিটাল রিচার্জ</span>
-              </h3>
+              <div>
+                <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                  <Wrench className="w-4 h-4 text-blue-400" />
+                  <span>{editingService ? 'সার্ভিস ও লোড এন্ট্রি এডিট করুন' : 'নতুন সার্ভিসিং ও ডিজিটাল রিচার্জ'}</span>
+                </h3>
+                <p className="text-[10px] text-slate-400 mt-0.5">
+                  {editingService ? 'ভুল এন্ট্রি বা টাকার পরিমাণ সংশোধন করে সেভ করুন' : 'সার্ভিস ও ফ্লেক্সিলোড/বিকাশ হিসাব যোগ করুন'}
+                </p>
+              </div>
               <button
-                onClick={() => setIsServiceModalOpen(false)}
+                onClick={() => {
+                  setIsServiceModalOpen(false);
+                  setEditingService(null);
+                }}
                 className="text-slate-400 hover:text-white bg-slate-800/80 rounded-full p-1.5"
               >
                 ✕
               </button>
             </div>
             <form onSubmit={handleSaveService} className="p-5 space-y-3.5">
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-400 mb-1">সার্ভিস টাইপ</label>
-                <select
-                  value={serviceFormData.type}
-                  onChange={e => setServiceFormData({ ...serviceFormData, type: e.target.value })}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500"
-                >
-                  <option value="Recharge/Flexiload">ফ্লেক্সিলোড / রিচার্জ / বিকাশ</option>
-                  <option value="Display Fitting">ডিসপ্লে চেঞ্জ ও ফিটিং</option>
-                  <option value="Hardware Repair">হার্ডওয়্যার আইসি / চার্জিং রিপেয়ার</option>
-                  <option value="Software Unlock">সফটওয়্যার ফ্ল্যাশ / আনলক</option>
-                  <option value="Apple ID/iCloud">অ্যাপল আইডি / বাইপাস</option>
-                </select>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-400 mb-1">সার্ভিস / লোড টাইপ</label>
+                  <select
+                    value={serviceFormData.type}
+                    onChange={e => setServiceFormData({ ...serviceFormData, type: e.target.value })}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500"
+                  >
+                    <option value="Recharge/Flexiload">ফ্লেক্সিলোড / রিচার্জ / বিকাশ</option>
+                    <option value="Display Fitting">ডিসপ্লে চেঞ্জ ও ফিটিং</option>
+                    <option value="Hardware Repair">হার্ডওয়্যার আইসি / চার্জিং রিপেয়ার</option>
+                    <option value="Software Unlock">সফটওয়্যার ফ্ল্যাশ / আনলক</option>
+                    <option value="Apple ID/iCloud">অ্যাপল আইডি / বাইপাস</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-400 mb-1">তারিখ (DD/MM/YYYY)</label>
+                  <input
+                    type="text"
+                    value={serviceFormData.date || new Date().toLocaleDateString('en-GB')}
+                    onChange={e => setServiceFormData({ ...serviceFormData, date: e.target.value })}
+                    placeholder="যেমন: 06/10/2026"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
               </div>
 
               <div>
-                <label className="block text-[11px] font-semibold text-slate-400 mb-1">বিবরণ / কাস্টমার তথ্য</label>
+                <label className="block text-[11px] font-semibold text-slate-400 mb-1">বিবরণ / নম্বর / কাজের তথ্য *</label>
                 <input
                   type="text"
                   value={serviceFormData.desc}
@@ -3152,12 +6299,36 @@ export default function App() {
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
+                  <label className="block text-[11px] font-semibold text-slate-400 mb-1">কাস্টমারের নাম (ঐচ্ছিক)</label>
+                  <input
+                    type="text"
+                    value={serviceFormData.customerName}
+                    onChange={e => setServiceFormData({ ...serviceFormData, customerName: e.target.value })}
+                    placeholder="গ্রাহকের নাম"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-400 mb-1">মোবাইল নম্বর (ঐচ্ছিক)</label>
+                  <input
+                    type="tel"
+                    value={serviceFormData.customerPhone}
+                    onChange={e => setServiceFormData({ ...serviceFormData, customerPhone: e.target.value })}
+                    placeholder="017XXXXXXXX"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
                   <label className="block text-[11px] font-semibold text-slate-400 mb-1">দোকানের নিজস্ব খরচ (৳)</label>
                   <input
                     type="number"
                     min="0"
+                    step="any"
                     value={serviceFormData.cost}
-                    onChange={e => setServiceFormData({ ...serviceFormData, cost: parseFloat(e.target.value) || 0 })}
+                    onChange={e => setServiceFormData({ ...serviceFormData, cost: e.target.value })}
                     placeholder="0"
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-100 font-mono font-bold focus:outline-none focus:border-blue-500"
                     required
@@ -3168,8 +6339,9 @@ export default function App() {
                   <input
                     type="number"
                     min="0"
+                    step="any"
                     value={serviceFormData.paid}
-                    onChange={e => setServiceFormData({ ...serviceFormData, paid: parseFloat(e.target.value) || 0 })}
+                    onChange={e => setServiceFormData({ ...serviceFormData, paid: e.target.value })}
                     placeholder="0"
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-emerald-400 font-mono font-bold focus:outline-none focus:border-blue-500"
                     required
@@ -3177,12 +6349,20 @@ export default function App() {
                 </div>
               </div>
 
+              {/* Live Profit Preview */}
+              <div className="bg-slate-950/80 border border-slate-800 rounded-xl px-3 py-2 flex items-center justify-between text-xs">
+                <span className="text-slate-400">এই সার্ভিস/লোড থেকে নিট লাভ:</span>
+                <span className="font-mono font-black text-cyan-400">
+                  ৳ {((parseFloat(String(serviceFormData.paid)) || 0) - (parseFloat(String(serviceFormData.cost)) || 0)).toLocaleString()}
+                </span>
+              </div>
+
               <div className="pt-2">
                 <button
                   type="submit"
                   className="w-full bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-slate-50 font-black py-2.5 rounded-xl text-xs shadow-lg transition-transform active:scale-95"
                 >
-                  সার্ভিস রেকর্ড সেভ করুন
+                  {editingService ? 'এডিট ও আপডেট সেভ করুন' : 'সার্ভিস রেকর্ড সেভ করুন'}
                 </button>
               </div>
             </form>
@@ -3256,6 +6436,7 @@ export default function App() {
           setCollectingCustomer(cust);
         }}
         onPrintStatement={handlePrintStatement}
+        onOpenQrCode={cust => handleOpenCustomerQr(cust.name, cust.phone || '', Math.max(0, cust.totalAmount - (cust.paidAmount || 0)))}
         onDeleteCustomer={handleDeleteDueCustomer}
         isAdmin={userRole === 'main_admin'}
       />
@@ -3264,6 +6445,7 @@ export default function App() {
       <ReceiptModal
         receipt={receiptData}
         onClose={() => setReceiptData(null)}
+        settings={shopSettings}
       />
 
       {/* ================= MODAL: CASH DRAWER RECONCILIATION ================= */}
@@ -3274,6 +6456,7 @@ export default function App() {
         services={servicesData}
         expenses={shopExpenses}
         dues={duesData}
+        cashPurchases={cashPurchases}
         activeSeller={activeSeller}
       />
 
@@ -3293,6 +6476,387 @@ export default function App() {
         isOpen={isProfitCalcOpen}
         onClose={() => setIsProfitCalcOpen(false)}
       />
+
+      {/* ================= MODAL: REPAIR JOB CARD (ADD / EDIT) ================= */}
+      <RepairJobModal
+        isOpen={isRepairModalOpen}
+        onClose={() => {
+          setIsRepairModalOpen(false);
+          setEditingRepairJob(null);
+        }}
+        activeSeller={activeSeller}
+        onSaveJob={handleSaveRepairJob}
+        nextJobNumber={repairJobs.length + 101}
+        editingJob={editingRepairJob}
+      />
+
+      {/* ================= MODAL: SHOP EXPENSES (ADD / EDIT) ================= */}
+      <ExpenseModal
+        isOpen={isExpenseModalOpen}
+        onClose={() => {
+          setIsExpenseModalOpen(false);
+          setEditingExpense(null);
+        }}
+        activeSeller={activeSeller}
+        onSaveExpense={handleSaveExpense}
+        recentExpenses={shopExpenses}
+        editingExpense={editingExpense}
+      />
+
+      {/* ================= MODAL: REORDER SHORTAGE LIST ================= */}
+      <ReorderModal
+        isOpen={isReorderModalOpen}
+        onClose={() => setIsReorderModalOpen(false)}
+        lowStockItems={inventory.filter(i => (i.stock || 0) <= 2)}
+      />
+
+      {/* ================= MODAL: PRE-ORDERS & PRODUCT DEMANDS (ADD / EDIT) ================= */}
+      <PreOrderModal
+        isOpen={isPreOrderModalOpen}
+        onClose={() => {
+          setIsPreOrderModalOpen(false);
+          setEditingPreOrder(null);
+        }}
+        activeSeller={activeSeller}
+        onSave={handleSavePreOrder}
+        editingOrder={editingPreOrder}
+        existingCustomers={duesData.map(d => ({ name: d.name, phone: d.phone }))}
+      />
+
+      {/* ================= MODAL: SHOP QUICK CALCULATOR ================= */}
+      <ShopCalculatorModal
+        isOpen={isCalculatorOpen}
+        onClose={() => setIsCalculatorOpen(false)}
+      />
+
+      {/* ================= MODAL: MULTI-ITEM POS CART ================= */}
+      <PosCartModal
+        isOpen={isCartModalOpen}
+        onClose={() => setIsCartModalOpen(false)}
+        cart={cart}
+        onUpdateQty={handleUpdateCartQty}
+        onRemoveItem={handleRemoveCartItem}
+        onClearCart={handleClearCart}
+        inventory={inventory}
+        onAddToCart={handleAddToCart}
+        existingCustomers={duesData}
+        activeSeller={activeSeller}
+        onCheckout={handleCartCheckout}
+        onOpenCashMemoStudio={() => setIsCashMemoStudioOpen(true)}
+      />
+
+      {/* ================= MODAL: PRO CASH MEMO & CUSTOM INVOICE STUDIO ================= */}
+      <CashMemoStudioModal
+        isOpen={isCashMemoStudioOpen}
+        onClose={() => setIsCashMemoStudioOpen(false)}
+        inventory={inventory}
+        salesHistory={salesHistory}
+        cart={cart}
+        customers={duesData}
+        activeSeller={activeSeller}
+        onShowToast={showToast}
+      />
+
+      {/* ================= MODAL: DAILY BUSINESS PROFIT & SUMMARY ================= */}
+      <DailySummaryModal
+        isOpen={isDailySummaryOpen}
+        onClose={() => setIsDailySummaryOpen(false)}
+        sales={salesHistory}
+        services={servicesData}
+        expenses={shopExpenses}
+        dues={duesData}
+        supplierDues={supplierDues}
+        cashPurchases={cashPurchases}
+        activeSeller={activeSeller}
+      />
+
+      {/* ================= MODAL: BARCODE & SKU CENTER ================= */}
+      <BarcodeScannerModal
+        isOpen={isBarcodeModalOpen}
+        onClose={() => setIsBarcodeModalOpen(false)}
+        inventory={inventory}
+        onOpenSell={handleOpenSell}
+        onAddToCart={handleAddToCart}
+        onOpenAddItemWithSku={handleOpenAddItem}
+        onDirectSaveItem={handleDirectSaveItem}
+        onUpdateItemSku={handleUpdateItemSku}
+        onOpenEditItem={handleOpenEditItem}
+        isPrivacyMode={isPrivacyMode}
+      />
+
+      {/* ================= MODAL: WHATSAPP & SMS MESSAGE HUB ================= */}
+      <MessageHubModal
+        isOpen={isMessageHubOpen}
+        onClose={() => setIsMessageHubOpen(false)}
+        customers={duesData}
+        onOpenQrCode={handleOpenCustomerQr}
+      />
+
+      {/* ================= MODAL: CUSTOMER WHATSAPP & CONTACT QR ================= */}
+      <CustomerQrModal
+        isOpen={isCustomerQrOpen}
+        onClose={() => setIsCustomerQrOpen(false)}
+        initialCustomerName={qrCustomerData.name}
+        initialPhone={qrCustomerData.phone}
+        initialDue={qrCustomerData.due}
+      />
+
+      {/* ================= MOBILE TOOLS DRAWER (BOTTOM SHEET) ================= */}
+      <MobileMenuDrawer
+        isOpen={isMobileMenuOpen}
+        onClose={() => setIsMobileMenuOpen(false)}
+        activeTab={activeTab}
+        onSelectTab={(tab) => setActiveTab(tab)}
+        onOpenSettings={() => setIsSettingsModalOpen(true)}
+        isPrivacyMode={isPrivacyMode}
+        togglePrivacyMode={togglePrivacyMode}
+        activeSeller={activeSeller}
+        sellers={sellers}
+        onSellerChange={handleSellerChange}
+        onOpenAddItem={handleOpenAddItem}
+        onOpenAddDue={() => {
+          setDuePreselectedCustomer(null);
+          setIsAddDueModalOpen(true);
+        }}
+        onOpenCart={() => setIsCartModalOpen(true)}
+        cartCount={cart.length}
+        onOpenCashMemoStudio={() => setIsCashMemoStudioOpen(true)}
+        onOpenDailySummary={() => setIsDailySummaryOpen(true)}
+        onOpenCashDrawer={() => setIsCashDrawerOpen(true)}
+        onOpenSupplierLedger={() => setIsSupplierModalOpen(true)}
+        onOpenProfitCalc={() => setIsProfitCalcOpen(true)}
+        onOpenCalculator={() => setIsCalculatorOpen(true)}
+        onOpenBarcode={() => setIsBarcodeModalOpen(true)}
+        onOpenMessageHub={() => setIsMessageHubOpen(true)}
+        onOpenCustomerQr={() => handleOpenCustomerQr('', '', 0)}
+        onOpenReorder={() => setIsReorderModalOpen(true)}
+        onOpenPreOrders={() => {
+          setActiveTab('preorders');
+          handleOpenAddPreOrder();
+        }}
+        preOrdersCount={productPreOrders.filter(o => o.status === 'pending').length}
+        onOpenExpense={() => {
+          setEditingExpense(null);
+          setIsExpenseModalOpen(true);
+        }}
+        onOpenRepair={() => {
+          setActiveTab('services');
+          setServiceSubTab('repairs');
+          handleOpenAddRepairJob();
+        }}
+        onExportCSVInventory={handleExportCSVInventory}
+        onExportCSVSales={handleExportCSVSales}
+        onExportCSVDues={handleExportCSVDues}
+        onExportJSON={handleExportJSON}
+        onImportJSON={handleImportJSON}
+        userRole={userRole}
+        isAdminLoggedIn={isAdminLoggedIn}
+        onOpenLogin={() => setIsLoginModalOpen(true)}
+        onLogout={handleLogout}
+        supplierCount={supplierDues.length}
+        lowStockCount={stockSummary.lowStockCount}
+        mobilePartsCount={mobilePartsCount}
+      />
+
+      {/* ================= MODAL: SHOP SETTINGS & SYSTEM CONFIGURATION ================= */}
+      <SettingsModal
+        isOpen={isSettingsModalOpen}
+        onClose={() => setIsSettingsModalOpen(false)}
+        settings={shopSettings}
+        onUpdateSettings={handleUpdateShopSettings}
+        sellers={sellers}
+        onAddSeller={name => {
+          if (!sellers.includes(name)) {
+            const updated = [...sellers, name];
+            setSellers(updated);
+            set(ref(rtdb, 'sellers'), updated);
+            showToast(`নতুন অপারেটর '${name}' যোগ করা হয়েছে! ✅`, 'success');
+          }
+        }}
+        onDeleteSeller={name => {
+          if (name.toLowerCase() === 'anik') {
+            showToast('মেইন অপারেটর রিমুভ করা যাবে না!', 'error');
+            return;
+          }
+          const updated = sellers.filter(s => s !== name);
+          setSellers(updated);
+          set(ref(rtdb, 'sellers'), updated);
+          showToast(`অপারেটর '${name}' সরানো হয়েছে!`, 'info');
+        }}
+        userRole={userRole}
+        isFirebaseConnected={isFirebaseConnected}
+        onExportJSON={handleExportJSON}
+        onImportJSON={handleImportJSON}
+        onExportCSVInventory={handleExportCSVInventory}
+        onExportCSVSales={handleExportCSVSales}
+        onExportCSVDues={handleExportCSVDues}
+        onClearRecentSearches={handleClearAllRecentSearches}
+        onEnableBrowserNotifications={handleEnableBrowserNotifications}
+        isBrowserNotificationEnabled={isBrowserNotificationEnabled}
+      />
+
+      {/* ================= LIVE SALE POPUP NOTIFICATION BANNER ================= */}
+      {latestSaleAlert && (
+        <div className="fixed top-4 right-4 z-50 max-w-sm sm:max-w-md w-[calc(100%-2rem)] bg-gradient-to-r from-slate-900 via-slate-900 to-emerald-950/95 border-2 border-emerald-500/80 text-slate-100 rounded-3xl p-4 shadow-2xl shadow-emerald-950/90 animate-in fade-in slide-in-from-top-4 duration-300 backdrop-blur-xl">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-11 h-11 rounded-2xl bg-emerald-500/20 border border-emerald-400/40 text-emerald-400 flex items-center justify-center flex-shrink-0 animate-bounce shadow-inner">
+                <span className="text-xl">💰</span>
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] font-black uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
+                    নতুন বিক্রি সম্পন্ন!
+                  </span>
+                  <span className="text-[10px] text-slate-400 font-mono">
+                    {latestSaleAlert.time}
+                  </span>
+                </div>
+                <h4 className="text-sm font-bold text-slate-100 truncate mt-0.5">
+                  {latestSaleAlert.name}
+                </h4>
+                <div className="flex items-center gap-2 text-xs mt-1 text-slate-300">
+                  <span>পরিমাণ: <strong className="text-white font-mono">{latestSaleAlert.qty}</strong> টি</span>
+                  <span>·</span>
+                  <span>অপারেটর: <strong className="text-cyan-400">{latestSaleAlert.seller}</strong></span>
+                  {latestSaleAlert.isBaki && (
+                    <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-1.5 py-0.2 rounded font-bold">
+                      বাকি
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="text-right flex-shrink-0">
+              <span className="block text-lg sm:text-xl font-black font-mono text-emerald-400">
+                ৳{latestSaleAlert.total.toLocaleString()}
+              </span>
+              <div className="flex items-center justify-end gap-1 mt-1">
+                <button
+                  type="button"
+                  onClick={() => playCashRegisterSound()}
+                  title="সাউন্ড আবার বাজান"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-emerald-400 hover:bg-slate-800 transition-colors"
+                >
+                  <Bell className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLatestSaleAlert(null)}
+                  title="নোটিফিকেশন বন্ধ করুন"
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================= TOAST NOTIFICATION BANNER ================= */}
+      {toastMessage && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-top-4 duration-200 max-w-sm w-[90%] pointer-events-none">
+          <div className={`p-3.5 rounded-2xl shadow-2xl border flex items-center gap-2.5 backdrop-blur-md ${
+            toastMessage.type === 'error'
+              ? 'bg-red-950/95 border-red-500 text-red-200 shadow-red-500/30'
+              : toastMessage.type === 'info'
+              ? 'bg-blue-950/95 border-blue-500 text-blue-200 shadow-blue-500/30'
+              : 'bg-emerald-950/95 border-emerald-500 text-emerald-200 shadow-emerald-500/30'
+          }`}>
+            <CheckCircle2 className={`w-5 h-5 flex-shrink-0 ${
+              toastMessage.type === 'error' ? 'text-red-400' : toastMessage.type === 'info' ? 'text-blue-400' : 'text-emerald-400'
+            }`} />
+            <p className="text-xs font-bold leading-tight">{toastMessage.text}</p>
+          </div>
+        </div>
+      )}
+
+      {/* ================= 📱 MODERN MOBILE FLOATING BOTTOM DOCK ================= */}
+      <nav className="sm:hidden fixed bottom-0 left-0 right-0 z-40 bg-slate-950/95 backdrop-blur-2xl border-t border-slate-800/90 px-2 py-1.5 flex justify-between items-center shadow-2xl">
+        {/* Tab 1: Home */}
+        <button
+          onClick={() => setActiveTab('home')}
+          className={`flex flex-col items-center justify-center py-1 px-2.5 rounded-2xl transition-all ${
+            activeTab === 'home'
+              ? 'bg-cyan-500/15 text-cyan-400 font-bold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Home className={`w-5 h-5 ${activeTab === 'home' ? 'stroke-[2.5]' : ''}`} />
+          <span className="text-[10px] mt-0.5 font-semibold">হোম</span>
+        </button>
+
+        {/* Tab 2: Mobile Parts (আলাদা অপশন: শুধু মোবাইল পার্টস) */}
+        <button
+          onClick={() => setActiveTab('mobile_parts')}
+          className={`flex flex-col items-center justify-center py-1 px-2.5 rounded-2xl transition-all ${
+            activeTab === 'mobile_parts'
+              ? 'bg-cyan-500/15 text-cyan-400 font-bold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Smartphone className={`w-5 h-5 ${activeTab === 'mobile_parts' ? 'stroke-[2.5]' : ''}`} />
+          <span className="text-[10px] mt-0.5 font-semibold">পার্টস ({mobilePartsCount})</span>
+        </button>
+
+        {/* Center Primary Quick Entry Button */}
+        <button
+          onClick={() => {
+            if (activeTab === 'inventory') {
+              handleOpenAddItem();
+            } else if (activeTab === 'services' && isMainAdmin) {
+              if (serviceSubTab === 'expenses') {
+                setEditingExpense(null);
+                setIsExpenseModalOpen(true);
+              } else if (serviceSubTab === 'digital') {
+                handleOpenAddService();
+              } else {
+                handleOpenAddRepairJob();
+              }
+            } else if (activeTab === 'dues') {
+              setDuePreselectedCustomer(null);
+              setIsAddDueModalOpen(true);
+            } else if (activeTab === 'preorders') {
+              handleOpenAddPreOrder();
+            } else {
+              handleOpenAddItem();
+            }
+          }}
+          className="w-12 h-12 -mt-6 rounded-2xl bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-slate-950 shadow-lg shadow-cyan-500/30 border-2 border-slate-950 active:scale-95 transition-all"
+          title="নতুন এন্ট্রি যোগ করুন"
+        >
+          <Plus className="w-6 h-6 stroke-[3]" />
+        </button>
+
+        {/* Tab 3: All Stock & Inventory */}
+        <button
+          onClick={() => setActiveTab('inventory')}
+          className={`flex flex-col items-center justify-center py-1 px-2.5 rounded-2xl transition-all ${
+            activeTab === 'inventory'
+              ? 'bg-cyan-500/15 text-cyan-400 font-bold'
+              : 'text-slate-400 hover:text-slate-200'
+          }`}
+        >
+          <Boxes className={`w-5 h-5 ${activeTab === 'inventory' ? 'stroke-[2.5]' : ''}`} />
+          <span className="text-[10px] mt-0.5 font-semibold">স্টক ({inventory.length})</span>
+        </button>
+
+        {/* Tab 4: Modern Tools & All Pages Drawer Trigger */}
+        <button
+          onClick={() => setIsMobileMenuOpen(true)}
+          className={`flex flex-col items-center justify-center py-1 px-2.5 rounded-2xl transition-all ${
+            isMobileMenuOpen
+              ? 'bg-cyan-500/20 text-cyan-300 font-bold'
+              : 'text-cyan-400 hover:text-cyan-300'
+          }`}
+        >
+          <Layers className="w-5 h-5" />
+          <span className="text-[10px] mt-0.5 font-bold">মেনু ও বাকি</span>
+        </button>
+      </nav>
     </div>
   );
 }

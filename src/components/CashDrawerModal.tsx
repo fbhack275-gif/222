@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
-import { X, DollarSign, Calculator, Printer, CheckCircle2, AlertTriangle, ArrowDownRight, ArrowUpRight } from 'lucide-react';
-import { SaleRecord, ServiceRecord, ShopExpense, CustomerDue } from '../types';
+import { X, DollarSign, Calculator, Printer, CheckCircle2, AlertTriangle, ArrowDownRight, ArrowUpRight, RefreshCw } from 'lucide-react';
+import { SaleRecord, ServiceRecord, ShopExpense, CustomerDue, CashPurchaseRecord } from '../types';
 
 interface CashDrawerModalProps {
   isOpen: boolean;
@@ -9,6 +9,7 @@ interface CashDrawerModalProps {
   services: ServiceRecord[];
   expenses: ShopExpense[];
   dues: CustomerDue[];
+  cashPurchases?: CashPurchaseRecord[];
   activeSeller: string;
 }
 
@@ -19,6 +20,7 @@ export const CashDrawerModal: React.FC<CashDrawerModalProps> = ({
   services,
   expenses,
   dues,
+  cashPurchases = [],
   activeSeller,
 }) => {
   const [openingBalance, setOpeningBalance] = useState<number>(() => {
@@ -79,18 +81,29 @@ export const CashDrawerModal: React.FC<CashDrawerModalProps> = ({
       }
     });
 
+    // 5. Cash spent on buying outside parts / restock today
+    let cashPurchasesOut = 0;
+    cashPurchases.forEach(p => {
+      if (p.date === todayStr) {
+        cashPurchasesOut += p.totalCost || 0;
+      }
+    });
+
     const totalCashIn = partsCash + servicesCash + dueCollectionsCash;
-    const expectedClosingCash = openingBalance + totalCashIn - expensesCash;
+    const totalCashOut = expensesCash + cashPurchasesOut;
+    const expectedClosingCash = openingBalance + totalCashIn - totalCashOut;
 
     return {
       partsCash,
       servicesCash,
       dueCollectionsCash,
       expensesCash,
+      cashPurchasesOut,
       totalCashIn,
+      totalCashOut,
       expectedClosingCash,
     };
-  }, [sales, services, expenses, dues, todayStr, openingBalance]);
+  }, [sales, services, expenses, dues, cashPurchases, todayStr, openingBalance]);
 
   // Physical notes count
   const physicalCount = useMemo(() => {
@@ -207,10 +220,20 @@ export const CashDrawerModal: React.FC<CashDrawerModalProps> = ({
             <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-2xl">
               <span className="block text-[10px] uppercase font-bold text-slate-400 flex items-center gap-1">
                 <ArrowUpRight className="w-3 h-3 text-red-400" />
-                আজকের খরচ (নগদ)
+                দোকান খরচ (নগদ)
               </span>
               <span className="block text-base font-black font-mono text-red-400 mt-1">
                 - ৳{cashCalculations.expensesCash.toLocaleString()}
+              </span>
+            </div>
+
+            <div className="bg-slate-950/60 border border-purple-500/30 p-3 rounded-2xl col-span-2 sm:col-span-4 flex items-center justify-between">
+              <span className="text-[11px] font-bold text-purple-300 flex items-center gap-1.5">
+                <RefreshCw className="w-3.5 h-3.5 text-purple-400" />
+                বিক্রির ক্যাশ টাকা দিয়ে পুনরায় মাল ক্রয় / বাহির থেকে পার্টস কেনা:
+              </span>
+              <span className="text-base font-black font-mono text-purple-400">
+                - ৳{cashCalculations.cashPurchasesOut.toLocaleString()}
               </span>
             </div>
           </div>
@@ -222,7 +245,7 @@ export const CashDrawerModal: React.FC<CashDrawerModalProps> = ({
                 ক্যাশ বাক্সে প্রত্যাশিত মোট টাকা (Expected Cash):
               </span>
               <span className="text-[11px] text-slate-500">
-                (ওপেনিং ৳{openingBalance} + মোট আগমন ৳{cashCalculations.totalCashIn} - মোট খরচ ৳{cashCalculations.expensesCash})
+                (ওপেনিং ৳{openingBalance} + মোট আগমন ৳{cashCalculations.totalCashIn} - মাল কেনা ও খরচ ৳{cashCalculations.totalCashOut})
               </span>
             </div>
             <span className="text-xl sm:text-2xl font-black font-mono text-emerald-400">
